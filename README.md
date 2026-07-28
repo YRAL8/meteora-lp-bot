@@ -1,0 +1,1 @@
+Read-only phase B1 for a future Meteora DLMM LP bot on Solana: find a public `PositionV2` for a given `LbPair` and print decoded position range, prices, composition, and unclaimed fees via Solana RPC (no keys, no signing, no transactions).
