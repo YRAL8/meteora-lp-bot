@@ -40,6 +40,52 @@ POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "300"))
 if POLL_INTERVAL_SEC < 1:
     raise ValueError("POLL_INTERVAL_SEC must be >= 1")
 
+# --- Auto-rebalance (C4). Default OFF — never spend without an explicit .env opt-in. ---
+AUTO_REBALANCE = _env_bool("AUTO_REBALANCE", "false")
+
+# Minutes out of range before acting. 20 is the measured optimum (Binance SOLUSDT
+# 5m candles, ±1.37%): ~62% of exits return within 20 min; longer wait loses more
+# idle time than it saves in avoided swaps.
+REBALANCE_DELAY_MIN = int(os.getenv("REBALANCE_DELAY_MIN", "20"))
+if REBALANCE_DELAY_MIN < 0:
+    raise ValueError("REBALANCE_DELAY_MIN must be >= 0")
+
+# Meteora-only storm guards (Orca has neither — rebalances are rarer there).
+MIN_REBALANCE_INTERVAL_MIN = int(os.getenv("MIN_REBALANCE_INTERVAL_MIN", "60"))
+if MIN_REBALANCE_INTERVAL_MIN < 0:
+    raise ValueError("MIN_REBALANCE_INTERVAL_MIN must be >= 0")
+
+MAX_REBALANCES_PER_DAY = int(os.getenv("MAX_REBALANCES_PER_DAY", "6"))
+if MAX_REBALANCES_PER_DAY < 1:
+    raise ValueError("MAX_REBALANCES_PER_DAY must be >= 1")
+
+# Periodic reminders while out-of-range and not acting (manual mode / low SOL /
+# daily cap). Orca uses 1h after the 2026-07-28 silent-night incident.
+REBALANCE_BLOCKED_REMINDER_HOURS = float(
+    os.getenv("REBALANCE_BLOCKED_REMINDER_HOURS", "1")
+)
+
+MIN_SOL_BALANCE = float(os.getenv("MIN_SOL_BALANCE", "0.05"))
+
+# Cap on position size in USD (open / add / rebalance reopen). Empty = unlimited
+# (wallet≈position model, same as Orca). Set e.g. 50 for safe rehearsals.
+_raw_max_pos = os.getenv("MAX_POSITION_USD", "").strip()
+MAX_POSITION_USD: float | None
+if not _raw_max_pos:
+    MAX_POSITION_USD = None
+else:
+    MAX_POSITION_USD = float(_raw_max_pos)
+    if MAX_POSITION_USD <= 0:
+        raise ValueError("MAX_POSITION_USD must be > 0 when set")
+
+# Payback diagnosis (warn only, never blocks). Swap cost ≈0.02% of position;
+# in-range earn ≈0.0071%/h → payback ≈2.8h. If median cycle life stays below
+# this, the width/pool choice is wrong — tell the owner, still rebalance.
+REBALANCE_PAYBACK_HOURS = float(os.getenv("REBALANCE_PAYBACK_HOURS", "2.8"))
+UNECONOMIC_LOOKBACK_CYCLES = int(os.getenv("UNECONOMIC_LOOKBACK_CYCLES", "5"))
+if UNECONOMIC_LOOKBACK_CYCLES < 1:
+    raise ValueError("UNECONOMIC_LOOKBACK_CYCLES must be >= 1")
+
 
 def dry_run() -> bool:
     return DRY_RUN

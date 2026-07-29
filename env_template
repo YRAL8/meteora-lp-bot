@@ -25,5 +25,36 @@ SOLANA_DEVNET_RPC_URL=https://api.devnet.solana.com
 # Seconds between monitoring ticks.
 POLL_INTERVAL_SEC=300
 
+# --- Auto-rebalance (C4) ---
+# Default OFF. Flip to true only when you consciously want the bot to spend.
+AUTO_REBALANCE=false
+
+# Minutes out of range before acting. Measured optimum for ±1.37%: ~62% of
+# exits return within 20 min; longer waits lose more idle fees than they save.
+REBALANCE_DELAY_MIN=20
+
+# Meteora storm guards (absent on Orca — rebalances fire far more often here).
+# Min gap between two auto-rebalances (minutes).
+MIN_REBALANCE_INTERVAL_MIN=60
+# Hard daily cap; at the limit the bot notifies and pauses auto until UTC midnight.
+MAX_REBALANCES_PER_DAY=6
+
+# Reminder cadence while out-of-range and not acting (hours).
+REBALANCE_BLOCKED_REMINDER_HOURS=1
+
+# SOL below this blocks the auto action (not monitoring). Timer is kept.
+MIN_SOL_BALANCE=0.05
+
+# Cap on how large a position may be (USD). Empty = no cap: after rebalance the
+# bot puts nearly the whole wallet into the pool (same model as Orca). Set a
+# number (e.g. 50) so a fat wallet cannot accidentally dump everything into LP
+# on the first rebalance — especially useful on thin devnet pools.
+# MAX_POSITION_USD=50
+
+# Payback diagnosis only (never blocks). Median cycle life vs ~2.8h payback
+# (swap ≈0.02% of position / in-range earn ≈0.0071%/h).
+REBALANCE_PAYBACK_HOURS=2.8
+UNECONOMIC_LOOKBACK_CYCLES=5
+
 # Used only by the standalone position reader (meteora_position.py).
 REQUEST_SLEEP_S=0.25

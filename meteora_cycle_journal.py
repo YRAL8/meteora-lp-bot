@@ -99,6 +99,7 @@ class PendingClose:
     close_position_value_usd: float
     fees_sol: float
     fees_usdc: float
+    trigger: str = "manual"  # "manual" | "auto"
 
 
 @dataclass
@@ -167,6 +168,7 @@ class CycleJournal:
                     close_position_value_usd=float(pc["close_position_value_usd"]),
                     fees_sol=float(pc["fees_sol"]),
                     fees_usdc=float(pc["fees_usdc"]),
+                    trigger=str(pc.get("trigger") or "manual"),
                 )
             if raw.get("pending_swap"):
                 ps = raw["pending_swap"]
@@ -216,6 +218,7 @@ class CycleJournal:
                 "close_position_value_usd": st.pending_close.close_position_value_usd,
                 "fees_sol": st.pending_close.fees_sol,
                 "fees_usdc": st.pending_close.fees_usdc,
+                "trigger": getattr(st.pending_close, "trigger", None) or "manual",
             }
         if st.pending_swap is not None:
             payload["pending_swap"] = asdict(st.pending_swap)
@@ -327,11 +330,13 @@ class CycleJournal:
         fees_usdc: float,
         position_pubkey: str | None = None,
         now: datetime | None = None,
+        trigger: str = "manual",
     ) -> None:
         now = now or _utc_now()
         st = self._load_state()
         if st.active is None:
             return
+        trig = trigger if trigger in ("manual", "auto") else "manual"
         pending = PendingClose(
             cycle=st.active,
             close_time_utc=_utc_iso(now),
@@ -339,6 +344,7 @@ class CycleJournal:
             close_position_value_usd=float(close_position_value_usd),
             fees_sol=float(fees_sol),
             fees_usdc=float(fees_usdc),
+            trigger=trig,
         )
         if position_pubkey and st.active.mint != position_pubkey:
             st.active.incomplete = True
@@ -452,6 +458,7 @@ class CycleJournal:
             "duration_hours": duration_hours,
             "incomplete": bool(cycle.incomplete),
             "incomplete_reasons": list(cycle.incomplete_reasons or []),
+            "trigger": getattr(st.pending_close, "trigger", None) or "manual",
         }
         self._append_jsonl(record)
         st.pending_close = None
