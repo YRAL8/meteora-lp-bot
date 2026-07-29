@@ -1,3 +1,4 @@
+import html
 import logging
 from collections import deque
 
@@ -7,10 +8,35 @@ import bot_config
 
 log = logging.getLogger(__name__)
 
+# Лимит Telegram Bot API на длину текста одного сообщения.
+TG_MAX_MESSAGE_LEN = 4096
+
 # Скользящее окно цены для тренда в /status — тот же принцип, что в orca-lp-bot
 # (telegram_bot.py: deque(maxlen=12)). При POLL_INTERVAL_SEC=300 12 точек — это час;
 # пополняется только тиками monitor_position() в main.py, не вызовами /status.
 price_history: deque[float] = deque(maxlen=12)
+
+
+def escape_html(text: object) -> str:
+    """Экранировать внешний текст для parse_mode=HTML (<, >, &)."""
+    return html.escape(str(text), quote=False)
+
+
+def format_html_error(prefix: str, err: object) -> str:
+    """Префикс + экранированный текст ошибки для HTML-сообщений."""
+    return f"{prefix}{escape_html(err)}"
+
+
+def short_addr(addr: str, head: int = 4, tail: int = 4) -> str:
+    """B6EfBviRXRRXW8XdwzGNoLCTiPuB7tshXHtMLkJvedRh -> B6Ef…vedRh.
+
+    Полный адрес в сообщении нечитаем и занимает всю строку; для сверки в
+    обозревателе хватает начала и хвоста, они уникальны на практике.
+    """
+    a = str(addr or "")
+    if len(a) <= head + tail + 1:
+        return a
+    return f"{a[:head]}…{a[-tail:]}"
 
 
 def format_position_table(position: dict, usdc_per_sol: float) -> str:
@@ -115,10 +141,12 @@ def format_exec_replies(payload: dict) -> str:
     if sends:
         lines = ["✅ <b>Транзакция отправлена</b>"]
         for s in sends:
-            sig = s.get("signature", "")
-            explorer = s.get("explorer")
-            if explorer:
-                lines.append(f'<a href="{explorer}">{sig}</a>')
+            sig = escape_html(s.get("signature", ""))
+            explorer = str(s.get("explorer") or "")
+            # Только http(s) — иначе href ломает HTML или уводит куда не надо.
+            if explorer.startswith("https://") or explorer.startswith("http://"):
+                href = html.escape(explorer, quote=True)
+                lines.append(f'<a href="{href}">{sig}</a>')
             else:
                 lines.append(f"<code>{sig}</code>")
         return "\n".join(lines)
@@ -128,9 +156,11 @@ def format_exec_replies(payload: dict) -> str:
         q = "?cluster=devnet" if cluster == "devnet" else ""
         lines = ["✅ <b>Транзакция отправлена</b>"]
         for sig in sigs:
-            lines.append(
-                f'<a href="https://explorer.solana.com/tx/{sig}{q}">{sig}</a>'
+            safe = escape_html(sig)
+            href = html.escape(
+                f"https://explorer.solana.com/tx/{sig}{q}", quote=True
             )
+            lines.append(f'<a href="{href}">{safe}</a>')
         return "\n".join(lines)
     return "✅ Готово (подпись не найдена в ответе)"
 
@@ -144,8 +174,9 @@ def send_telegram_message(text: str) -> None:
         return
     if not text:
         return
-    if len(text) > 4096:
-        text = text[:4093] + "..."
+    if len(text) > TG_MAX_MESSAGE_LEN:
+        # Грубая обрезка — вызывающий код (например /pnl) должен укладываться сам.
+        text = text[: TG_MAX_MESSAGE_LEN - 3] + "..."
 
     try:
         resp = requests.post(

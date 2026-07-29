@@ -1,4 +1,4 @@
-"""Telegram command handlers — menu parity with orca-lp-bot."""
+"""Telegram command handlers — menu parity with orca-lp-bot + C5 keyboard."""
 from __future__ import annotations
 
 import json
@@ -6,7 +6,13 @@ import logging
 from typing import Any
 
 from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 import bot_config
 import bot_state
@@ -14,14 +20,19 @@ import meteora_cycle_journal as cycle_journal
 import meteora_ops
 import money_ops
 import range_state
+import telegram_keyboard as kb
 from meteora_exec import MeteoraExecError
 from meteora_ops import MeteoraOpsError
+from money_ops import SwapFailedOpenAborted
 from reopen_pending import is_reopen_pending, load_reopen_pending
 from telegram_notify import (
+    TG_MAX_MESSAGE_LEN,
+    escape_html,
     format_position_table,
     format_price_trend,
     format_range_bar,
     position_in_range,
+    short_addr,
 )
 
 log = logging.getLogger(__name__)
@@ -41,6 +52,7 @@ _OWNER_COMMANDS = (
 )
 
 # Same order and labels as orca_bot/telegram_bot.py _MENU_COMMANDS.
+# /start and keyboard help are NOT part of this ten-command menu.
 _MENU_COMMANDS = [
     BotCommand("status", "Статус позиции и баланс"),
     BotCommand("pnl", "PnL по циклам (журнал)"),
@@ -109,7 +121,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         bal = meteora_ops.balances(owner, **kw)
         pool = meteora_ops.pool_info(**kw)
         positions = money_ops.list_open_positions()
-        mode = "DEMO/devnet" if bot_config.DRY_RUN else "БОЕВОЙ"
+        mode = "DEMO" if bot_config.DRY_RUN else "БОЕВОЙ"
         net = bot_config.effective_network()
         sol_ui = (bal.get("sol") or {}).get("ui", 0)
         usdc_ui = (bal.get("usdc") or {}).get("ui", 0)
@@ -117,24 +129,25 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         bin_step = int(pool["binStep"])
         usdc_per_sol = float(pool.get("usdcPerSol") or 0)
         trend = format_price_trend(usdc_per_sol, bot_config.POLL_INTERVAL_SEC)
-        lines = [
-            f"📊 <b>Статус [{mode}, {net}]</b>",
-            f"Кошелёк: <code>{owner}</code>",
-            f"SOL: {sol_ui:.6f} · USDC: {usdc_ui:.2f}",
-            f"Пул: <code>{bot_config.pool_pubkey()}</code>",
-            f"📈 Цена SOL: ${usdc_per_sol:.4f}{trend}",
-            f"Диапазон по умолчанию: ±{range_state.current_range_pct():g}% "
-            f"(half={range_state.current_half_width()} bins, binStep={bin_step})",
-        ]
+        price_line = f"📈 Цена SOL: ${usdc_per_sol:,.2f}{trend}"
+
+        # Порядок строк как в /status боевого orca-lp-bot: заголовок -> позиция ->
+        # цена -> диапазон -> статус -> балансы. Технические подробности (адреса,
+        # ячейки, binStep) уходят одной сноской в конец, чтобы не забивать экран.
+        lines = [f"📊 <b>Статус [{mode}]</b>"]
+
         if is_reopen_pending():
-            lines.append("⚠️ <b>reopen_pending</b> — ребаланс оборван между close и open!")
+            lines.append("⚠️ <b>Ребаланс оборвался</b> между закрытием и открытием!")
+
         if not positions:
-            lines.append("\n⏳ Открытых позиций нет.")
+            lines.append("⏳ Открытых позиций нет.")
+            lines.append(price_line)
         else:
             for pos in positions:
                 in_rng = position_in_range(pos, active_id)
                 status = "✅ в диапазоне" if in_rng else "⚠️ ВНЕ диапазона"
                 lines.append(format_position_table(pos, usdc_per_sol))
+                lines.append(price_line)
                 lines.append(
                     format_range_bar(
                         int(pos["lowerBinId"]),
@@ -144,7 +157,24 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         bin_step,
                     )
                 )
-                lines.append(f"Статус: {status}")
+                lines.append(f"   Статус: {status}")
+
+        lines.append(f"Кошелёк: {sol_ui:.4f} SOL · {usdc_ui:.2f} USDC")
+
+        cap = getattr(bot_config, "MAX_POSITION_USD", None)
+        cap_note = f" · потолок ${cap:g}" if cap else ""
+        # Показываем ширину, посчитанную из фактических ячеек и binStep этого пула,
+        # а не сохранённый процент: при старте они расходятся (пришедшие из env 5%
+        # против дефолтных 34 ячеек = ±0.34% на binStep=1), и цифра врала бы.
+        half = range_state.current_half_width()
+        actual_pct = ((1.0 + bin_step / 10_000.0) ** half - 1.0) * 100.0
+        lines.append(
+            f"<i>Новые позиции: ±{actual_pct:.2f}% ({half} ячеек){cap_note}</i>"
+        )
+        lines.append(
+            f"<i>{net} · кошелёк {short_addr(owner)} · пул "
+            f"{short_addr(bot_config.pool_pubkey())}</i>"
+        )
         await _reply(update, "\n".join(lines), parse_mode="HTML")
     except Exception as e:
         log.exception("Ошибка /status")
@@ -166,7 +196,12 @@ def _fmt_money(x: float) -> str:
     return f"{sign}${abs(x):.2f}"
 
 
-def _render_pnl_message(*, cycles: list[dict], recent_limit: int = 10) -> str:
+def _render_pnl_message(
+    *,
+    cycles: list[dict],
+    recent_limit: int = 10,
+    include_width_detail: bool = True,
+) -> str:
     if not cycles:
         return (
             "📈 <b>PnL по циклам</b>\n"
@@ -201,6 +236,8 @@ def _render_pnl_message(*, cycles: list[dict], recent_limit: int = 10) -> str:
         f"Циклов: {len(complete)} · fees ${_fmt_money(total_fees).lstrip('+')} · "
         f"div {_fmt_money(total_div)}"
     )
+    if not include_width_detail:
+        return "\n".join(lines)
     by_width: dict[float, list[dict]] = {}
     for c in complete:
         w = float(c.get("range_width_pct", 0.0))
@@ -229,11 +266,32 @@ def _render_pnl_message(*, cycles: list[dict], recent_limit: int = 10) -> str:
     return "\n".join(lines)
 
 
+def render_pnl_message(*, cycles: list[dict], recent_limit: int = 10) -> str:
+    """Собрать /pnl и уложить в лимит Telegram (4096), укорачивая список циклов."""
+    text = _render_pnl_message(cycles=cycles, recent_limit=recent_limit)
+    if len(text) <= TG_MAX_MESSAGE_LEN:
+        return text
+    for limit in range(min(recent_limit, len(cycles)) - 1, 0, -1):
+        text = _render_pnl_message(cycles=cycles, recent_limit=limit)
+        if len(text) <= TG_MAX_MESSAGE_LEN:
+            note = f"\n<i>… показано последних {limit} из {len(cycles)} циклов</i>"
+            if len(text) + len(note) <= TG_MAX_MESSAGE_LEN:
+                return text + note
+            return text
+    text = _render_pnl_message(
+        cycles=cycles, recent_limit=1, include_width_detail=False
+    )
+    if len(text) <= TG_MAX_MESSAGE_LEN:
+        return text
+    cut = TG_MAX_MESSAGE_LEN - 20
+    return text[:cut] + "\n… (обрезано)"
+
+
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         j = cycle_journal.get_default_journal()
         cycles = j.read_all_cycles()
-        text = _render_pnl_message(cycles=cycles, recent_limit=10)
+        text = render_pnl_message(cycles=cycles, recent_limit=10)
         await _reply(update, text, parse_mode="HTML")
     except Exception as e:
         log.exception("Ошибка /pnl")
@@ -366,6 +424,9 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await flush()
             money_ops.open_with_budget(usdc_amount, reply=collector)
             await flush()
+        except SwapFailedOpenAborted as e:
+            await flush()
+            await _reply(update, f"❌ Открытие отменено: {e}")
         except MeteoraExecError as e:
             await _reply(update, f"❌ {e}")
         except Exception as e:
@@ -446,9 +507,11 @@ async def addliquidity_command(
                 collector(
                     "⚠️ Позиция сейчас ВНЕ диапазона — доливка ляжет в основном в один токен."
                 )
-            collector(f"💧 Доливаю ${usdc_amount:.2f} USDC в текущую позицию...")
-            await flush()
             money_ops.add_with_budget(position, usdc_amount, reply=collector)
+            await flush()
+        except SwapFailedOpenAborted:
+            # add_with_budget уже отправил одно понятное сообщение с причиной —
+            # второе «Доливка отменена: swap failed on add» было техническим дублем.
             await flush()
         except MeteoraExecError as e:
             await _reply(update, f"❌ {e}")
@@ -526,6 +589,9 @@ async def rebalance_command(
     Manual rebalance. Blocked by /stop (bot_frozen), NOT by /pauza —
     /pauza only stops the automatic monitor tick; a manual Telegram call is an
     intentional owner action (same principle as Orca).
+
+    Bare /rebalance (and the keyboard button) only shows a confirmation prompt.
+    Run with `/rebalance confirm`. Test hook: `/rebalance crash-after-close`.
     """
     if bot_state.bot_frozen:
         await _reply(update, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
@@ -535,19 +601,47 @@ async def rebalance_command(
         return
     if is_reopen_pending():
         meta = load_reopen_pending() or {}
+        meta_s = escape_html(json.dumps(meta, ensure_ascii=False)[:400])
         await _reply(
             update,
             "⚠️ <b>reopen_pending уже стоит</b> — прошлый ребаланс оборвался между "
-            f"close и open.\nmeta={json.dumps(meta, ensure_ascii=False)[:400]}\n"
+            f"close и open.\nmeta={meta_s}\n"
             "Сначала дожми вручную (/open) или сними флаг осознанно.",
             parse_mode="HTML",
         )
         return
 
-    crash = bool(context.args) and context.args[0].lower() in (
-        "crash-after-close",
-        "crash",
-    )
+    args = [a.lower() for a in (context.args or [])]
+    crash = bool(args) and args[0] in ("crash-after-close", "crash")
+    confirmed = bool(args) and args[0] == "confirm"
+    if not confirmed and not crash:
+        try:
+            position = money_ops.get_primary_position()
+        except Exception as e:
+            await _reply(update, f"❌ Не удалось загрузить позицию: {e}")
+            return
+        if position is None:
+            await _reply(update, "❌ Нет открытой позиции для ребаланса.")
+            return
+        pool = meteora_ops.pool_info(**money_ops.ops_kwargs())
+        price = float(pool.get("usdcPerSol") or 0)
+        val = money_ops.position_value_usd(position, price)
+        cost_est = val * 0.0002  # ~0.02% of position
+        half = range_state.current_half_width()
+        pct = range_state.current_range_pct()
+        await _reply(
+            update,
+            f"🔄 <b>Ребаланс</b>\n"
+            f"Сейчас: ${val:.2f} · bins "
+            f"[{position['lowerBinId']},{position['upperBinId']}]\n"
+            f"Будет: закрыть → при необходимости свопнуть → открыть вокруг "
+            f"текущей цены (±{pct}% / half={half}).\n"
+            f"Ориентир стоимости перестановки: ~${cost_est:.4f} "
+            f"(≈0.02% от позиции).\n\n"
+            f"Подтвердить: /rebalance confirm",
+            parse_mode="HTML",
+        )
+        return
 
     async with bot_state.money_lock:
         position = money_ops.get_primary_position()
@@ -572,6 +666,9 @@ async def rebalance_command(
         except SystemExit:
             await flush()
             raise
+        except SwapFailedOpenAborted as e:
+            await flush()
+            await _reply(update, f"❌ Ребаланс: реоткрытие отменено: {e}")
         except MeteoraExecError as e:
             await _reply(update, f"❌ Ошибка ребаланса: {e}")
         except Exception as e:
@@ -603,7 +700,212 @@ async def boevoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     bot_state.bot_paused = False
     bot_state.bot_frozen = False
     await _reply(
-        update, "⚔️ Боевой режим — автоматика и все ручные команды снова работают."
+        update,
+        "⚔️ Боевой режим — автоматика и все ручные команды снова работают.",
+        reply_markup=kb.build_main_keyboard(),
+    )
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show persistent keyboard. Not part of the ten-command BotFather menu."""
+    await _reply(
+        update,
+        "🤖 <b>Meteora LP-бот</b>\n"
+        "Кнопки внизу — то же, что команды меню. "
+        "Нажми «❓ Справка», если непонятно, что делает кнопка.",
+        parse_mode="HTML",
+        reply_markup=kb.build_main_keyboard(),
+    )
+
+
+async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _reply(
+        update,
+        kb.format_help_message(),
+        parse_mode="HTML",
+        reply_markup=kb.build_main_keyboard(),
+    )
+
+
+async def open_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Keyboard «Открыть»: context + clickable /open N suggestions from balance."""
+    try:
+        owner = money_ops.owner()
+        kw = money_ops.ops_kwargs()
+        bal = meteora_ops.balances(owner, **kw)
+        pool = meteora_ops.pool_info(**kw)
+        price = float(pool.get("usdcPerSol") or 0)
+        sol_ui = float((bal.get("sol") or {}).get("ui") or 0)
+        usdc_ui = float((bal.get("usdc") or {}).get("ui") or 0)
+        wallet_usd = sol_ui * price + usdc_ui
+        amounts = kb.suggest_open_amounts_usd(wallet_usd)
+        half = range_state.current_half_width()
+        # Процент считаем из фактических ячеек и binStep пула, а не из сохранённого
+        # range_width_pct: при старте тот приходит из env (5%) и не совпадает с
+        # дефолтными 34 ячейками (±0.34% при binStep=1) — подсказка бы врала.
+        bin_step = int(pool["binStep"])
+        pct = ((1.0 + bin_step / 10_000.0) ** half - 1.0) * 100.0
+        existing = money_ops.get_primary_position()
+        if existing is not None:
+            val = money_ops.position_value_usd(existing, price)
+            await _reply(
+                update,
+                f"🆕 Открыть позицию\n"
+                f"Уже есть открытая (~${val:.2f}) — сначала /rebalance или "
+                f"/withdraw confirm.\n"
+                f"На кошельке: {sol_ui:.4f} SOL + {usdc_ui:.2f} USDC "
+                f"(≈${wallet_usd:.0f})",
+            )
+            return
+        if not amounts:
+            await _reply(
+                update,
+                f"🆕 Открыть позицию\n"
+                f"На кошельке: {sol_ui:.4f} SOL + {usdc_ui:.2f} USDC "
+                f"(≈${wallet_usd:.2f}) — мало для открытия.\n"
+                f"Пополни кошелёк или укажи сумму вручную: /open &lt;USDC&gt;",
+                parse_mode="HTML",
+            )
+            return
+        examples = "     ".join(f"/open {a:g}" for a in amounts)
+        await _reply(
+            update,
+            f"🆕 <b>Открыть позицию</b>\n"
+            f"На кошельке: {sol_ui:.4f} SOL + {usdc_ui:.2f} USDC "
+            f"(≈${wallet_usd:.0f})\n"
+            f"Диапазон сейчас: ±{pct:.2f}% ({half} ячеек)\n\n"
+            f"Отправь сумму в USDC-эквиваленте (нажми пример):\n"
+            f"{examples}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        log.exception("open_prompt failed")
+        await _reply(update, f"❌ Не удалось подготовить подсказку /open: {e}")
+
+
+async def addliquidity_prompt(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    try:
+        pos = money_ops.get_primary_position()
+        if pos is None:
+            await _reply(
+                update,
+                "➕ Долить\nОткрытой позиции нет — сначала «🆕 Открыть» или /open.",
+            )
+            return
+        owner = money_ops.owner()
+        kw = money_ops.ops_kwargs()
+        bal = meteora_ops.balances(owner, **kw)
+        pool = meteora_ops.pool_info(**kw)
+        price = float(pool.get("usdcPerSol") or 0)
+        sol_ui = float((bal.get("sol") or {}).get("ui") or 0)
+        usdc_ui = float((bal.get("usdc") or {}).get("ui") or 0)
+        wallet_usd = sol_ui * price + usdc_ui
+        try:
+            mx = money_ops.compute_max_addliquidity_usdc(pos)
+        except Exception:
+            mx = wallet_usd * 0.5
+        cap = max(0.0, min(wallet_usd * 0.95, mx if mx > 0 else wallet_usd * 0.95))
+        amounts = kb.suggest_open_amounts_usd(cap)
+        val = money_ops.position_value_usd(pos, price)
+        if not amounts:
+            await _reply(
+                update,
+                f"➕ Долить в позицию (~${val:.2f})\n"
+                f"Свободно мало. Можно: /addliquidity max",
+            )
+            return
+        examples = "     ".join(f"/addliquidity {a:g}" for a in amounts)
+        await _reply(
+            update,
+            f"➕ <b>Долить</b> в позицию (~${val:.2f})\n"
+            f"На кошельке ≈${wallet_usd:.0f}; безопасно до ~${cap:.2f}.\n"
+            f"Границы позиции не меняются.\n\n"
+            f"Отправь сумму или нажми пример:\n"
+            f"{examples}     /addliquidity max",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        log.exception("addliquidity_prompt failed")
+        await _reply(update, f"❌ Не удалось подготовить подсказку: {e}")
+
+
+async def setrange_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        pool = meteora_ops.pool_info(**money_ops.ops_kwargs())
+        bin_step = int(pool["binStep"])
+        max_bins = int(pool["maxBinsPerPosition"])
+        max_pct = range_state.max_pct_for_pool(bin_step, max_bins)
+        max_half = range_state.max_half_width_bins(max_bins)
+        cur = range_state.current_range_pct()
+        half = range_state.current_half_width()
+        opts = kb.suggest_range_pcts(
+            current_pct=cur,
+            max_pct=max_pct,
+            min_pct=range_state.MIN_RANGE_PCT,
+        )
+        examples = "     ".join(f"/setrange {p:g}" for p in opts)
+        await _reply(
+            update,
+            f"📐 <b>Диапазон</b>\n"
+            f"Сейчас: ±{cur:g}% (half={half} ячеек)\n"
+            f"Максимум на этом пуле (binStep={bin_step}): ±{max_pct:.4f}% "
+            f"(half ≤ {max_half}, ≤{max_bins} ячеек в позиции)\n"
+            f"Минимум ввода: {range_state.MIN_RANGE_PCT}%\n\n"
+            f"Отправь процент или нажми пример:\n"
+            f"{examples}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        log.exception("setrange_prompt failed")
+        await _reply(update, f"❌ Не удалось подготовить подсказку /setrange: {e}")
+
+
+async def keyboard_button_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Map reply-keyboard labels to the same handlers as slash commands."""
+    msg = update.effective_message
+    if msg is None or not msg.text:
+        return
+    text = msg.text.strip()
+    context.args = []
+
+    if text == kb.BTN_STATUS:
+        await status_command(update, context)
+    elif text == kb.BTN_PNL:
+        await pnl_command(update, context)
+    elif text == kb.BTN_REBALANCE:
+        await rebalance_command(update, context)
+    elif text == kb.BTN_ADD:
+        await addliquidity_prompt(update, context)
+    elif text == kb.BTN_OPEN:
+        await open_prompt(update, context)
+    elif text == kb.BTN_RANGE:
+        await setrange_prompt(update, context)
+    elif text == kb.BTN_PAUSE:
+        await pauza_command(update, context)
+    elif text == kb.BTN_COMBAT:
+        await boevoy_command(update, context)
+    elif text == kb.BTN_STOP:
+        await stop_command(update, context)
+    elif text == kb.BTN_WITHDRAW:
+        await withdraw_command(update, context)
+    elif text == kb.BTN_HELP:
+        await help_button(update, context)
+
+
+async def unauthorized_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    chat = update.effective_chat
+    chat_id = chat.id if chat is not None else None
+    text = update.effective_message.text if update.effective_message else None
+    log.warning(
+        "Ignored Telegram message from unauthorized chat_id=%s text=%r",
+        chat_id,
+        (text or "")[:80],
     )
 
 
@@ -615,6 +917,7 @@ def build_telegram_app() -> Application:
         return app
     owner_chat = filters.Chat(chat_id=owner_id)
     for name, handler in (
+        ("start", start_command),
         ("status", status_command),
         ("pnl", pnl_command),
         ("setrange", setrange_command),
@@ -632,6 +935,14 @@ def build_telegram_app() -> Application:
             list(_OWNER_COMMANDS),
             unauthorized_command,
             filters=~owner_chat,
+        )
+    )
+    button_filter = filters.TEXT & ~filters.COMMAND & owner_chat
+    app.add_handler(MessageHandler(button_filter, keyboard_button_handler))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~owner_chat,
+            unauthorized_message,
         )
     )
     return app
