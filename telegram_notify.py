@@ -1,0 +1,168 @@
+import logging
+from collections import deque
+
+import requests
+
+import bot_config
+
+log = logging.getLogger(__name__)
+
+# Скользящее окно цены для тренда в /status — тот же принцип, что в orca-lp-bot
+# (telegram_bot.py: deque(maxlen=12)). При POLL_INTERVAL_SEC=300 12 точек — это час;
+# пополняется только тиками monitor_position() в main.py, не вызовами /status.
+price_history: deque[float] = deque(maxlen=12)
+
+
+def format_position_table(position: dict, usdc_per_sol: float) -> str:
+    """SOL/USDC composition table for one DLMM position — стиль orca-lp-bot."""
+    sol = float(position.get("sol") or 0)
+    usdc = float(position.get("usdc") or 0)
+    fees = position.get("fees") or {}
+    fee_sol = float(fees.get("sol") or 0)
+    fee_usdc = float(fees.get("usdc") or 0)
+
+    value_sol_usd = sol * usdc_per_sol
+    value_usdc_usd = usdc  # 1 USDC ~= $1
+    total_usd = value_sol_usd + value_usdc_usd
+    fees_usd = fee_sol * usdc_per_sol + fee_usdc
+
+    table = (
+        f"{'':5}{'qty':>10}  {'USD':>8}\n"
+        f"{'SOL':5}{sol:>10.4f}  ${value_sol_usd:>7.2f}\n"
+        f"{'USDC':5}{usdc:>10.2f}  ${value_usdc_usd:>7.2f}\n"
+        f"{'─' * 25}\n"
+        f"{'TOTAL':5}{'':10}  ${total_usd:>7.2f}\n"
+        f"{'Fees':5}{'':10}  ${fees_usd:>7.2f}"
+    )
+    return f"💰 <b>Позиция: ${total_usd:.2f}</b>\n<pre>{table}</pre>"
+
+
+def format_range_bar(
+    lower_bin: int,
+    upper_bin: int,
+    active_bin: int,
+    active_price_usd: float,
+    bin_step: int,
+) -> str:
+    """Прогресс-бар диапазона в $ (не в bin-ID) — стиль orca-lp-bot.
+
+    Цены на границах выводятся из активной цены масштабированием на
+    (1+binStep/10000)^(bin-active_bin) — тот же геометрический шаг ячейки,
+    которым Meteora считает цену внутри пула, без обращения к decimals токенов.
+    """
+    width = 16
+    span = upper_bin - lower_bin
+    frac = (active_bin - lower_bin) / span if span > 0 else 0.5
+    filled = min(max(round(frac * width), 0), width)
+    bar = "█" * filled + "░" * (width - filled)
+
+    growth = 1 + bin_step / 10_000
+    lo_price = active_price_usd * (growth ** (lower_bin - active_bin))
+    hi_price = active_price_usd * (growth ** (upper_bin - active_bin))
+
+    extra = ""
+    if active_bin < lower_bin and lo_price:
+        extra = f" ↓ {(lo_price - active_price_usd) / lo_price * 100:.1f}%"
+    elif active_bin > upper_bin and hi_price:
+        extra = f" ↑ +{(active_price_usd - hi_price) / hi_price * 100:.1f}%"
+
+    return (
+        f"<code>{bar}</code>{extra}\n"
+        f"L ${lo_price:.2f}  C ${active_price_usd:.2f}  U ${hi_price:.2f}"
+    )
+
+
+def _format_trend_period(seconds: int) -> str:
+    minutes = max(1, seconds // 60) if seconds > 0 else 0
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours = minutes // 60
+    rem = minutes % 60
+    return f"{hours}ч" if rem == 0 else f"{hours}ч {rem}мин"
+
+
+def format_price_trend(current_price: float, poll_interval_sec: int) -> str:
+    """Стрелка и % изменения цены от старейшей точки price_history.
+
+    Пустая строка, пока накопилось меньше 2 отсчётов (сразу после старта бота).
+    """
+    if len(price_history) < 2:
+        return ""
+    oldest = price_history[0]
+    if oldest <= 0:
+        return ""
+    change_pct = (current_price - oldest) / oldest * 100
+    if change_pct > 0.5:
+        arrow = "↗"
+    elif change_pct < -0.5:
+        arrow = "↘"
+    else:
+        arrow = "→"
+    period = _format_trend_period(len(price_history) * poll_interval_sec)
+    sign = "+" if change_pct >= 0 else ""
+    return f" ({arrow} {sign}{change_pct:.1f}% за {period})"
+
+
+def position_in_range(position: dict, active_id: int) -> bool:
+    lo = int(position["lowerBinId"])
+    hi = int(position["upperBinId"])
+    return lo <= active_id <= hi
+
+
+def format_exec_replies(payload: dict) -> str:
+    """Format exec.ts JSON with explorer links."""
+    sends = payload.get("sends") or []
+    if sends:
+        lines = ["✅ <b>Транзакция отправлена</b>"]
+        for s in sends:
+            sig = s.get("signature", "")
+            explorer = s.get("explorer")
+            if explorer:
+                lines.append(f'<a href="{explorer}">{sig}</a>')
+            else:
+                lines.append(f"<code>{sig}</code>")
+        return "\n".join(lines)
+    sigs = payload.get("signatures") or []
+    if sigs:
+        cluster = bot_config.explorer_cluster()
+        q = "?cluster=devnet" if cluster == "devnet" else ""
+        lines = ["✅ <b>Транзакция отправлена</b>"]
+        for sig in sigs:
+            lines.append(
+                f'<a href="https://explorer.solana.com/tx/{sig}{q}">{sig}</a>'
+            )
+        return "\n".join(lines)
+    return "✅ Готово (подпись не найдена в ответе)"
+
+
+def send_telegram_message(text: str) -> None:
+    """Best-effort Telegram notification; never raises."""
+    token = bot_config.TELEGRAM_BOT_TOKEN
+    chat_id = bot_config.TELEGRAM_CHAT_ID
+
+    if bot_config.is_placeholder(token) or bot_config.is_placeholder(chat_id):
+        return
+    if not text:
+        return
+    if len(text) > 4096:
+        text = text[:4093] + "..."
+
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception:
+        log.warning("Telegram sendMessage failed (request error).", exc_info=True)
+        return
+
+    if resp.status_code != 200:
+        body = (resp.text or "").strip()
+        if len(body) > 500:
+            body = body[:500] + "..."
+        log.warning(
+            "Telegram sendMessage failed (HTTP %s). Response: %s",
+            resp.status_code,
+            body,
+        )
