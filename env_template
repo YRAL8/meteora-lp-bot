@@ -1,3 +1,29 @@
-SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+# Copy to .env and fill in. .env is gitignored — never commit real values.
+
+# --- Telegram ---
+# Bot token from @BotFather, and the chat id allowed to command the bot.
+# Commands from any other chat are ignored.
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+
+# --- Network ---
+# DRY_RUN=true pins everything to devnet regardless of any other setting.
+# Mainnet additionally requires METEORA_ALLOW_MAINNET=1 in the process
+# environment — deliberately not placed in this file.
+DRY_RUN=true
+
+# --- Wallet ---
+# Path to a Solana JSON keypair. Keep it outside the repository.
+WALLET_KEYPAIR_PATH=~/.config/solana/meteora-devnet.json
+
+# --- Pool and RPC ---
+# Default pool is SOL-USDC on mainnet; override for devnet rehearsals.
 DLMM_LB_PAIR=5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6
+SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+SOLANA_DEVNET_RPC_URL=https://api.devnet.solana.com
+
+# Seconds between monitoring ticks.
+POLL_INTERVAL_SEC=300
+
+# Used only by the standalone position reader (meteora_position.py).
 REQUEST_SLEEP_S=0.25
