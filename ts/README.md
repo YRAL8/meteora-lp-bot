@@ -48,7 +48,7 @@ node dist/cli.js build-swap --owner <PUBKEY> --side sol-to-usdc --amount 0.05
 |---|---|
 | `pool-info` | `DLMM.create`, `getActiveBin`, `fromPricePerLamport` → `usdcPerSol` |
 | `balances` | RPC балансы + ATA; `solAvailableForOpen` = SOL − feeReserve − рента позиции |
-| `suggest-amounts` | `autoFillYByStrategy` / `autoFillXByStrategy` → `targetSolFraction`, `needSol`/`needUsdc`, `swapSuggestion` |
+| `suggest-amounts` | `autoFillYByStrategy` / `autoFillXByStrategy` → `targetSolFraction`, `needSol`/`needUsdc`, `swapSuggestion`. **Budget = total position USD** (`budgetSol*price + budgetUsdc`), not a single leg. |
 | `list-positions` | `getPositionsByUserAndLbPair` |
 | `build-open` | `--position-pubkey` или эфемерный pubkey + `initializePositionAndAddLiquidityByStrategy` |
 | `build-add` | `addLiquidityByStrategy` / `Chunkable`; без `--allow-multi-tx` отказывает при >1 TX |

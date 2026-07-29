@@ -215,13 +215,31 @@ async function withRpcRetry<T>(
     } catch (err) {
       last = err;
       const msg = err instanceof Error ? err.message : String(err);
+      const low = msg.toLowerCase();
       const is429 =
         msg.includes("429") ||
-        msg.toLowerCase().includes("too many requests") ||
+        low.includes("too many requests") ||
         msg.includes("rate limit");
-      if (!is429 || i === retries - 1) throw err;
+      // Обрыв связи с узлом столь же временен, как и 429, но раньше улетал
+      // наружу сразу: пользователь видел голое "fetch failed" и жал кнопку
+      // заново. Повторяем те же ошибки, что и лимит частоты.
+      const isTransientNetwork =
+        low.includes("fetch failed") ||
+        low.includes("socket hang up") ||
+        low.includes("network error") ||
+        low.includes("econnreset") ||
+        low.includes("econnrefused") ||
+        low.includes("etimedout") ||
+        low.includes("timeout") ||
+        low.includes("eai_again") ||
+        low.includes("502") ||
+        low.includes("503") ||
+        low.includes("504");
+      if ((!is429 && !isTransientNetwork) || i === retries - 1) throw err;
       const pause = 400 * Math.pow(2, i) + Math.floor(Math.random() * 200);
-      eprint(`RPC retry after 429 on ${label}, sleep ${pause}ms`);
+      eprint(
+        `RPC retry (${is429 ? "429" : "network"}) on ${label}, sleep ${pause}ms`
+      );
       await sleep(pause);
     }
   }
@@ -1373,12 +1391,12 @@ export async function cmdSuggestAmounts(
   let targetSolFractionFinal = 0.5;
 
   if (rangeKind === "entirely-above-active") {
-    // Only SOL (token X when solIsX) for a range above the active bin.
+    // Only SOL for a range above the active bin.
+    // totalBudgetUsd is the full position size (not a single-leg hint).
     if (!order.solIsX) {
       fail(action, "pool with SOL as tokenY not implemented for suggest-amounts", "runtime");
     }
-    needSol =
-      budgetSol !== undefined ? budgetSol : totalBudgetUsd / usdcPerSol;
+    needSol = totalBudgetUsd / usdcPerSol;
     needUsdc = 0;
     targetSolFractionFinal = 1;
   } else if (rangeKind === "entirely-below-active") {
@@ -1386,56 +1404,29 @@ export async function cmdSuggestAmounts(
       fail(action, "pool with SOL as tokenY not implemented for suggest-amounts", "runtime");
     }
     needSol = 0;
-    needUsdc = budgetUsdc !== undefined ? budgetUsdc : totalBudgetUsd;
+    needUsdc = totalBudgetUsd;
     targetSolFractionFinal = 0;
   } else if (order.solIsX) {
-    if (budgetSol !== undefined && budgetUsdc === undefined) {
-      const x = uiToAmount(budgetSol, order.solDecimals);
-      const y = autoFillYByStrategy(
-        activeId,
-        binStep,
-        x,
-        amountXInActiveBin,
-        amountYInActiveBin,
-        minBinId,
-        maxBinId,
-        strategyType
-      );
-      needSol = budgetSol;
-      needUsdc = amountToUi(y, order.usdcDecimals);
-    } else if (budgetUsdc !== undefined && budgetSol === undefined) {
-      const y = uiToAmount(budgetUsdc, order.usdcDecimals);
-      const x = autoFillXByStrategy(
-        activeId,
-        binStep,
-        y,
-        amountXInActiveBin,
-        amountYInActiveBin,
-        minBinId,
-        maxBinId,
-        strategyType
-      );
-      needUsdc = budgetUsdc;
-      needSol = amountToUi(x, order.solDecimals);
-    } else {
-      const probeX = uiToAmount(1, order.solDecimals);
-      const probeY = autoFillYByStrategy(
-        activeId,
-        binStep,
-        probeX,
-        amountXInActiveBin,
-        amountYInActiveBin,
-        minBinId,
-        maxBinId,
-        strategyType
-      );
-      const pSol = 1;
-      const pUsdc = amountToUi(probeY, order.usdcDecimals);
-      const pTotal = pSol * usdcPerSol + pUsdc;
-      targetSolFractionFinal = pTotal > 0 ? (pSol * usdcPerSol) / pTotal : 0.5;
-      needSol = (totalBudgetUsd * targetSolFractionFinal) / usdcPerSol;
-      needUsdc = totalBudgetUsd * (1 - targetSolFractionFinal);
-    }
+    // Straddling Spot: always treat budget as TOTAL position USD
+    // (budgetSol*price + budgetUsdc), split by autoFill ratio.
+    // Sole --budget-usdc N ⇒ position ≈ $N (not a $N USDC leg + matching SOL).
+    const probeX = uiToAmount(1, order.solDecimals);
+    const probeY = autoFillYByStrategy(
+      activeId,
+      binStep,
+      probeX,
+      amountXInActiveBin,
+      amountYInActiveBin,
+      minBinId,
+      maxBinId,
+      strategyType
+    );
+    const pSol = 1;
+    const pUsdc = amountToUi(probeY, order.usdcDecimals);
+    const pTotal = pSol * usdcPerSol + pUsdc;
+    targetSolFractionFinal = pTotal > 0 ? (pSol * usdcPerSol) / pTotal : 0.5;
+    needSol = (totalBudgetUsd * targetSolFractionFinal) / usdcPerSol;
+    needUsdc = totalBudgetUsd * (1 - targetSolFractionFinal);
     const needSolUsd = needSol * usdcPerSol;
     const needTotalUsd = needSolUsd + needUsdc;
     if (needTotalUsd > 0) targetSolFractionFinal = needSolUsd / needTotalUsd;

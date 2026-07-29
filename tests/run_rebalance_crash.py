@@ -77,7 +77,7 @@ async def main() -> None:
     print("full rebalance without crash…")
     set_reopen_pending(False)  # ensure clean; prior failed mid-rebalance left flag
     # If still pending from failed reopen, clear after verifying capital on wallet
-    await call("rebalance", [])
+    await call("rebalance", ["confirm"])
     if is_reopen_pending():
         print("rebalance left pending — recovering via /open")
         pos = money_ops.get_primary_position()

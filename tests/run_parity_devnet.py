@@ -116,7 +116,7 @@ async def main() -> None:
         pos = money_ops.get_primary_position()
         if pos:
             # Full rebalance without crash
-            results.append(await _run("rebalance", []))
+            results.append(await _run("rebalance", ["confirm"]))
             _print(results[-1])
 
         pos = money_ops.get_primary_position()
