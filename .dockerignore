@@ -1,0 +1,14 @@
+.git
+.env
+state/
+.venv/
+venv/
+__pycache__/
+*.pyc
+ts/node_modules/
+ts/dist/
+tests/
+ROADMAP.md
+TASK_*.md
+REPORT_*.md
+AUDIT_*.md
