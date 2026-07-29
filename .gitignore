@@ -12,3 +12,16 @@ venv/
 
 # Приватные заметки и план — не для репозитория
 ROADMAP.md
+TASK_*.md
+REPORT_*.md
+AUDIT_*.md
+
+# Сборка и зависимости TS-прослойки
+ts/node_modules/
+ts/dist/
+
+# Журнал отправок и ключи — никогда в репозиторий
+state/
+*.json.key
+wallet*.json
+keypair*.json
