@@ -99,6 +99,27 @@ export function hasUnresolved(entries: JournalEntry[]): boolean {
 
 export type ConfirmOutcome = "confirmed" | "failed" | "unknown";
 
+/** Same transient class as build_lib.withRpcRetry — do not give up the poll window. */
+export function isTransientRpcError(msg: string): boolean {
+  const low = msg.toLowerCase();
+  return (
+    msg.includes("429") ||
+    low.includes("too many requests") ||
+    low.includes("rate limit") ||
+    low.includes("fetch failed") ||
+    low.includes("socket hang up") ||
+    low.includes("network error") ||
+    low.includes("econnreset") ||
+    low.includes("econnrefused") ||
+    low.includes("etimedout") ||
+    low.includes("timeout") ||
+    low.includes("eai_again") ||
+    low.includes("502") ||
+    low.includes("503") ||
+    low.includes("504")
+  );
+}
+
 export async function pollSignatureStatus(
   connection: Connection,
   signature: string,
@@ -106,6 +127,7 @@ export async function pollSignatureStatus(
   pollMs = 2_000
 ): Promise<{ outcome: ConfirmOutcome; slot: number | null; error: string | null }> {
   const start = Date.now();
+  let lastError: string | null = null;
   while (Date.now() - start < timeoutMs) {
     let resp;
     try {
@@ -114,7 +136,16 @@ export async function pollSignatureStatus(
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      return { outcome: "unknown", slot: null, error: msg };
+      lastError = msg;
+      // Temporary network blip: keep polling until the window is exhausted.
+      if (isTransientRpcError(msg)) {
+        await new Promise((r) => setTimeout(r, pollMs));
+        continue;
+      }
+      // Non-transient RPC error — still wait out the window once; do not
+      // treat a single hiccup as definitive "unknown" if time remains.
+      await new Promise((r) => setTimeout(r, pollMs));
+      continue;
     }
     const st = resp.value[0];
     if (st) {
@@ -132,7 +163,7 @@ export async function pollSignatureStatus(
     }
     await new Promise((r) => setTimeout(r, pollMs));
   }
-  return { outcome: "unknown", slot: null, error: null };
+  return { outcome: "unknown", slot: null, error: lastError };
 }
 
 export async function resolveJournalOnStartup(

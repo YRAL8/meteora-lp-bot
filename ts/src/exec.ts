@@ -241,10 +241,26 @@ async function sendBuildResult(
       );
     }
     if (status === "unknown") {
+      // Unknown ≠ success. Stop the batch; leave journal as unknown; do not
+      // retry send. Caller (Python) must treat ok:false and keep reopen_pending.
       eprint(
-        `warning: tx[${txMeta.index}] confirmation unknown — journal left as unknown; ` +
-          "do not retry blindly"
+        `tx[${txMeta.index}] confirmation unknown — failing this exec; ` +
+          "journal left as unknown; do not retry blindly"
       );
+      process.stdout.write(
+        JSON.stringify({
+          ok: false,
+          action,
+          error: `tx[${txMeta.index}] confirmation unknown — do not retry blindly`,
+          stage: "confirm-unknown",
+          confirmationUnknown: true,
+          network,
+          signatures,
+          sends,
+          params,
+        }) + "\n"
+      );
+      process.exit(1);
     }
     await sleep(500);
   }
@@ -265,6 +281,63 @@ async function sendBuildResult(
 
 async function main(): Promise<void> {
   const { cmd, flags } = parseArgs(process.argv.slice(2));
+
+  // Chat-reachable unlock path: re-poll unresolved journal entries (no send).
+  if (cmd === "resolve-journal") {
+    const network = parseNetwork(flags, cmd);
+    const rpc =
+      flagStr(flags, "rpc") || defaultRpcForNetwork(network);
+    const connection = new Connection(rpc, "confirmed");
+    const journalPath = defaultJournalPath();
+    const pollMs = Number(flagStr(flags, "poll-ms") || "1500");
+    const timeoutMs = Number(flagStr(flags, "timeout-ms") || "60000");
+    eprint(`resolve-journal rpc=${rpc} journal=${journalPath}`);
+    const before = unresolvedEntries(readJournal(journalPath));
+    for (const e of before) {
+      const { outcome, slot, error } = await pollSignatureStatus(
+        connection,
+        e.signature,
+        timeoutMs,
+        pollMs
+      );
+      if (outcome === "confirmed") {
+        updateJournalBySignature(journalPath, e.signature, {
+          status: "confirmed",
+          slot,
+          error: null,
+        });
+      } else if (outcome === "failed") {
+        updateJournalBySignature(journalPath, e.signature, {
+          status: "failed",
+          slot,
+          error,
+        });
+      }
+    }
+    const after = unresolvedEntries(readJournal(journalPath));
+    process.stdout.write(
+      JSON.stringify({
+        ok: true,
+        action: "resolve-journal",
+        network,
+        journalPath,
+        before: before.map((e) => ({
+          signature: e.signature,
+          status: e.status,
+          action: e.action,
+        })),
+        stillUnresolved: after.map((e) => ({
+          signature: e.signature,
+          status: e.status,
+          action: e.action,
+          explorer: explorerTxUrl(e.signature, network),
+        })),
+        cleared: before.length - after.length,
+      }) + "\n"
+    );
+    return;
+  }
+
   if (!isExecCommand(cmd)) {
     fail(cmd, `unknown command: ${cmd}`, "parseArgs");
   }

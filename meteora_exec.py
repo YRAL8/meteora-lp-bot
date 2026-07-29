@@ -58,6 +58,11 @@ def run_exec(
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
+    # Propagate priority fee default into child (TS reads PRIORITY_FEE_MICROLAMPORTS).
+    env.setdefault(
+        "PRIORITY_FEE_MICROLAMPORTS",
+        os.getenv("PRIORITY_FEE_MICROLAMPORTS", "50000"),
+    )
     proc = subprocess.run(
         cmd,
         cwd=str(ROOT),
@@ -273,6 +278,75 @@ def exec_swap(
     if force_ignore_journal:
         args.append("--force-ignore-journal")
     return run_exec(args, send=send, **kwargs)
+
+
+def resolve_journal(
+    *,
+    timeout_ms: int = 60_000,
+    network: str = "devnet",
+    rpc: Optional[str] = None,
+    pool: Optional[str] = None,
+    extra_env: Optional[Dict[str, str]] = None,
+    timeout_s: float = 120.0,
+) -> Dict[str, Any]:
+    """Re-poll unresolved journal entries (no send). Chat-reachable unlock step 1."""
+    return run_exec(
+        ["resolve-journal", "--timeout-ms", str(int(timeout_ms))],
+        send=False,
+        network=network,
+        rpc=rpc,
+        pool=pool,
+        extra_env=extra_env,
+        timeout_s=timeout_s,
+    )
+
+
+def forget_unresolved_journal(*, reason: str = "owner cleared via Telegram") -> Dict[str, Any]:
+    """Mark remaining pending/unknown rows as failed so money paths unblock.
+
+    Does NOT send anything. Owner must have checked explorer first.
+    """
+    journal_path = ROOT / "state" / "exec_journal.jsonl"
+    if not journal_path.is_file():
+        return {"ok": True, "cleared": 0, "stillUnresolved": []}
+    lines = journal_path.read_text(encoding="utf-8").splitlines()
+    entries: List[Dict[str, Any]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        entries.append(json.loads(line))
+    # Latest row per signature wins (same as TS unresolvedEntries).
+    by_sig: Dict[str, Dict[str, Any]] = {}
+    for e in entries:
+        by_sig[str(e.get("signature"))] = e
+    cleared = 0
+    for sig, e in by_sig.items():
+        if e.get("status") in ("pending", "unknown"):
+            # Patch the last matching line in the full list.
+            for i in range(len(entries) - 1, -1, -1):
+                if entries[i].get("signature") == sig:
+                    entries[i] = {
+                        **entries[i],
+                        "status": "failed",
+                        "error": reason,
+                    }
+                    cleared += 1
+                    break
+    body = "\n".join(json.dumps(e, ensure_ascii=False) for e in entries)
+    journal_path.write_text(body + ("\n" if body else ""), encoding="utf-8")
+    remaining = [
+        e
+        for e in {e.get("signature"): e for e in entries}.values()
+        if e.get("status") in ("pending", "unknown")
+    ]
+    return {
+        "ok": True,
+        "cleared": cleared,
+        "stillUnresolved": [
+            {"signature": e.get("signature"), "status": e.get("status")}
+            for e in remaining
+        ],
+    }
 
 
 def main() -> None:

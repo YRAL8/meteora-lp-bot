@@ -18,7 +18,10 @@ from telegram_notify import escape_html, format_exec_replies
 log = logging.getLogger(__name__)
 
 FEE_RESERVE_SOL = float(os.getenv("FEE_RESERVE_SOL", "0.02"))
-MIN_SOL_BALANCE = float(os.getenv("MIN_SOL_BALANCE", "0.05"))
+# Prefer bot_config (raised default 0.08); keep env override for scripts.
+MIN_SOL_BALANCE = float(
+    os.getenv("MIN_SOL_BALANCE", str(getattr(bot_config, "MIN_SOL_BALANCE", 0.08)))
+)
 
 # Refuse opens smaller than this after scaling (dust / failed-swap dead ends).
 _MIN_OPEN_USD = 0.05
@@ -47,6 +50,7 @@ def exec_kwargs() -> dict[str, Any]:
         "pool": bot_config.pool_pubkey(),
         "rpc": bot_config.effective_rpc(net),
         "extra_env": extra_env,
+        "priority_fee": int(bot_config.PRIORITY_FEE_MICROLAMPORTS),
     }
 
 
@@ -174,6 +178,7 @@ def apply_swap_suggestion(suggestion: dict | None, reply: Callable[[str], Any]) 
         # reply уходит в Telegram с parse_mode=HTML — экранируем внешний текст.
         reply(f"своп {human_side} не прошёл: {escape_html(human)}")
         return False
+    assert_exec_fully_confirmed(payload)
     reply(f"своп {human_side}: {amount:.6f} ✅")
     price = float(meteora_ops.pool_info(**ops_kwargs()).get("usdcPerSol") or 0)
     direction = "SOL_TO_USDC" if side == "sol-to-usdc" else "USDC_TO_SOL"
@@ -227,8 +232,40 @@ def _wallet_balances() -> tuple[float, float, float]:
     bal = meteora_ops.balances(owner(), **ops_kwargs())
     sol_have = float((bal.get("sol") or {}).get("ui") or 0)
     usdc_have = float((bal.get("usdc") or {}).get("ui") or 0)
-    usable_sol = max(0.0, sol_have - MIN_SOL_BALANCE)
+    # Prefer TS field that already subtracts fee reserve + position rent.
+    sao = bal.get("solAvailableForOpen")
+    if sao is not None:
+        usable_sol = max(0.0, float(sao))
+    else:
+        usable_sol = max(0.0, sol_have - MIN_SOL_BALANCE)
     return sol_have, usdc_have, usable_sol
+
+
+def assert_exec_fully_confirmed(payload: dict) -> None:
+    """Refuse to treat confirmation-unknown as success (belt after TS ok:false)."""
+    if payload.get("confirmationUnknown"):
+        raise MeteoraExecError(
+            {
+                "ok": False,
+                "error": "confirmation unknown — do not retry blindly",
+                "stage": "confirm-unknown",
+                "confirmationUnknown": True,
+                **{k: payload.get(k) for k in ("signatures", "sends", "action")},
+            }
+        )
+    for s in payload.get("sends") or []:
+        st = s.get("status")
+        if st and st != "confirmed":
+            raise MeteoraExecError(
+                {
+                    "ok": False,
+                    "error": f"tx status={st!r} — not confirmed",
+                    "stage": "confirm-unknown" if st == "unknown" else "confirm",
+                    "confirmationUnknown": st == "unknown",
+                    "sends": payload.get("sends"),
+                    "signatures": payload.get("signatures"),
+                }
+            )
 
 
 def open_with_budget(
@@ -332,6 +369,7 @@ def open_with_budget(
         max_bin_id=max_bin,
         **exec_kwargs(),
     )
+    assert_exec_fully_confirmed(payload)
     reply(format_exec_replies(payload))
     pk = (payload.get("params") or {}).get("positionPubkey")
     if not pk:
@@ -364,6 +402,12 @@ def open_with_budget(
             open_usdc_qty=usdc_qty,
             open_position_value_usd=sol_qty * price + usdc_qty,
         )
+        # Manual recovery after aborted rebalance: successful open clears the flag.
+        from reopen_pending import is_reopen_pending
+
+        if is_reopen_pending():
+            set_reopen_pending(False)
+            reply("✅ reopen_pending снят после успешного открытия.")
     return payload
 
 
@@ -425,6 +469,7 @@ def add_with_budget(
         allow_multi_tx=True,
         **exec_kwargs(),
     )
+    assert_exec_fully_confirmed(payload)
     reply(format_exec_replies(payload))
     cycle_journal.safe_call(
         cycle_journal.get_default_journal().mark_add_liquidity_incomplete
@@ -434,12 +479,9 @@ def add_with_budget(
 
 def compute_max_addliquidity_usdc(position: dict) -> float:
     """Max TOTAL USD that can be added given wallet legs and MAX_POSITION_USD."""
-    bal = meteora_ops.balances(owner(), **ops_kwargs())
-    usdc_balance = float((bal.get("usdc") or {}).get("ui") or 0)
-    sol_balance = float((bal.get("sol") or {}).get("ui") or 0)
+    _, usdc_balance, usable_sol = _wallet_balances()
     pool = meteora_ops.pool_info(**ops_kwargs())
     price = float(pool.get("usdcPerSol") or 0)
-    usable_sol = max(0.0, sol_balance - MIN_SOL_BALANCE)
 
     ref = suggest_for_budget(
         1.0,
@@ -512,6 +554,7 @@ def close_position_full(
     else:
         reply("🔒 Закрываю позицию (withdraw 100% + claim + close)…")
         cl = meteora_exec.exec_close(owner(), pk, **exec_kwargs())
+    assert_exec_fully_confirmed(cl)
     reply(format_exec_replies(cl))
     clear_last_position()
 
@@ -556,7 +599,11 @@ def rebalance_position(
     bal = meteora_ops.balances(owner(), **ops_kwargs())
     sol_ui = float((bal.get("sol") or {}).get("ui") or 0)
     usdc_ui = float((bal.get("usdc") or {}).get("ui") or 0)
-    usable_sol = max(0.0, sol_ui - MIN_SOL_BALANCE)
+    sao = bal.get("solAvailableForOpen")
+    if sao is not None:
+        usable_sol = max(0.0, float(sao))
+    else:
+        usable_sol = max(0.0, sol_ui - MIN_SOL_BALANCE)
     budget = (usable_sol * price + usdc_ui) * 0.98
     if budget <= 0:
         reply("❌ Недостаточно средств для реоткрытия после закрытия.")

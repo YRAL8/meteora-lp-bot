@@ -14,6 +14,7 @@ import telegram_commands as tg
 import telegram_notify
 from reopen_pending import is_reopen_pending, load_reopen_pending
 from telegram_notify import (
+    escape_html,
     format_position_table,
     format_price_trend,
     format_range_bar,
@@ -131,8 +132,8 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                 send_telegram_message(
                     "⚠️ <b>reopen_pending</b> — авто-ребаланс не стартует.\n"
                     "Капитал на кошельке после оборванного close→open.\n"
-                    f"<code>{meta}</code>\n"
-                    "Дожми /open вручную или разберись, затем сними флаг."
+                    f"<code>{escape_html(str(meta)[:400])}</code>\n"
+                    "Дожми /open вручную или /status journal."
                 )
                 _mark_blocked_reminder_sent(now)
             log.warning("reopen_pending — пропускаю авто-ребаланс")
@@ -244,6 +245,22 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                 _mark_blocked_reminder_sent(now)
             return
 
+        # Mainnet auto requires an explicit position ceiling (audit B3B).
+        if (
+            bot_config.effective_network() == "mainnet"
+            and bot_config.MAX_POSITION_USD is None
+        ):
+            if _should_send_blocked_reminder(now):
+                send_telegram_message(
+                    "🛑 <b>AUTO_REBALANCE на mainnet без MAX_POSITION_USD</b>\n"
+                    "Автоматика отключена, пока не задашь потолок в .env "
+                    "(иначе ребаланс втянет почти весь кошелёк).\n"
+                    "Ручной /rebalance по-прежнему доступен."
+                )
+                _mark_blocked_reminder_sent(now)
+            log.error("AUTO_REBALANCE+mainnet without MAX_POSITION_USD — skip")
+            return
+
         # --- AUTO path: re-check price after delay ---
         pool2 = meteora_ops.pool_info(**kw)
         active2 = int(pool2["activeId"])
@@ -341,7 +358,30 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                 )
                 return
             try:
-                money_ops.rebalance_position(fresh, reply=collector, auto=True)
+                payload = await asyncio.to_thread(
+                    money_ops.rebalance_position,
+                    fresh,
+                    reply=collector,
+                    auto=True,
+                )
+                from reopen_pending import is_reopen_pending as _pending_now
+
+                if payload is None or _pending_now():
+                    meta = load_reopen_pending() or {}
+                    send_telegram_message(
+                        "🚨 <b>Авто-ребаланс НЕ завершён</b>\n"
+                        "Позиция закрыта или капитал на кошельке; "
+                        "<code>reopen_pending</code> остаётся.\n"
+                        f"meta={escape_html(str(meta)[:400])}\n"
+                        "Суточный лимит НЕ засчитан. "
+                        "Дожми /open вручную или /status journal."
+                    )
+                    log.warning(
+                        "Авто-ребаланс aborted (payload=%s pending=%s) — не success",
+                        payload is not None,
+                        _pending_now(),
+                    )
+                    return
                 ar_limits.record_rebalance(lim, now)
                 _reset_rebalance_blocked_state()
                 send_telegram_message("✅ Авто-ребаланс завершён.")
@@ -380,9 +420,21 @@ async def main() -> None:
         send_telegram_message(
             "⚠️ <b>ВНИМАНИЕ: reopen_pending</b>\n"
             "Прошлый ребаланс оборвался между закрытием и открытием.\n"
-            f"<code>{meta}</code>\n"
-            "Капитал на кошельке. Дожми /open или разберись вручную — "
+            f"<code>{escape_html(str(meta)[:400])}</code>\n"
+            "Капитал на кошельке. Дожми /open или /status journal — "
             "бот НЕ будет молча продолжать как ни в чём не бывало."
+        )
+
+    if (
+        bot_config.AUTO_REBALANCE
+        and bot_config.effective_network() == "mainnet"
+        and bot_config.MAX_POSITION_USD is None
+    ):
+        log.error("AUTO_REBALANCE on mainnet without MAX_POSITION_USD")
+        send_telegram_message(
+            "🛑 <b>AUTO_REBALANCE на mainnet без MAX_POSITION_USD</b>\n"
+            "Автоматика не будет тратить деньги, пока не задашь потолок. "
+            "Ручные команды работают."
         )
 
     async def _monitor_loop() -> None:

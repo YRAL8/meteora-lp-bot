@@ -43,13 +43,20 @@ MAX_REBALANCES_PER_DAY=6
 REBALANCE_BLOCKED_REMINDER_HOURS=1
 
 # SOL below this blocks the auto action (not monitoring). Timer is kept.
-MIN_SOL_BALANCE=0.05
+# Must cover position rent (~0.057 SOL for 69 bins) + fee headroom; Python
+# prefers balances.solAvailableForOpen when present.
+MIN_SOL_BALANCE=0.08
 
 # Cap on how large a position may be (USD). Empty = no cap: after rebalance the
 # bot puts nearly the whole wallet into the pool (same model as Orca). Set a
 # number (e.g. 50) so a fat wallet cannot accidentally dump everything into LP
 # on the first rebalance — especially useful on thin devnet pools.
+# REQUIRED when AUTO_REBALANCE=true on mainnet.
 # MAX_POSITION_USD=50
+
+# Priority fee in microlamports per compute unit (TS + Python). Default 50000 ≈
+# Helius "medium" / reliable inclusion without overpaying. Override if congested.
+PRIORITY_FEE_MICROLAMPORTS=50000
 
 # Payback diagnosis only (never blocks). Median cycle life vs ~2.8h payback
 # (swap ≈0.02% of position / in-range earn ≈0.0071%/h).

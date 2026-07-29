@@ -265,8 +265,9 @@ class ComputeMaxTests(unittest.TestCase):
                         return_value=_suggest(1.0, sol_frac=0.5, price=100.0),
                     ):
                         mx = money_ops.compute_max_addliquidity_usdc(pos)
-        # usable_sol = 0.10 → max by sol = 0.10/0.005 = 20; by usdc = 20/0.5 = 40 → 20*0.98
-        self.assertAlmostEqual(mx, 0.10 / 0.005 * 0.98, places=4)
+        # usable_sol = 0.15 - MIN_SOL_BALANCE (0.08) = 0.07
+        usable = 0.15 - money_ops.MIN_SOL_BALANCE
+        self.assertAlmostEqual(mx, usable / 0.005 * 0.98, places=4)
 
 
 if __name__ == "__main__":

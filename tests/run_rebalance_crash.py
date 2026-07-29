@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Focused /rebalance crash-after-close recovery test on devnet."""
+"""Focused rebalance crash-after-close recovery test on devnet (C8).
+
+Crash is triggered via METEORA_CRASH_AFTER_CLOSE=1 — not via Telegram.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -43,11 +46,14 @@ async def main() -> None:
     if ghosts:
         print(f"NOTE: {len(ghosts)} zero-liq ghost position(s) ignored by bot")
 
-    # Close any live position
     pos = money_ops.get_primary_position()
     if pos:
         print("cleanup live position…")
         await call("withdraw", ["confirm"])
+
+    # Telegram must refuse the old crash hook.
+    refuse = await call("rebalance", ["crash-after-close"])
+    assert any("убран" in r or "confirm" in r for r in refuse), refuse
 
     range_state.half_width_bins = 3
     range_state.range_width_pct = 0.03
@@ -57,8 +63,20 @@ async def main() -> None:
     print("pos", pos and pos.get("pubkey"), pos and (pos.get("sol"), pos.get("usdc")))
     assert pos, "open failed"
 
-    print("rebalance crash-after-close…")
-    await call("rebalance", ["crash-after-close"])
+    print("rebalance with METEORA_CRASH_AFTER_CLOSE=1…")
+    os.environ["METEORA_CRASH_AFTER_CLOSE"] = "1"
+    try:
+        replies: list[str] = []
+        try:
+            money_ops.rebalance_position(pos, reply=replies.append)
+        except SystemExit as e:
+            print(f"SystemExit({e.code}) expected")
+            assert e.code == 42
+        for r in replies:
+            print(r[:280])
+    finally:
+        os.environ.pop("METEORA_CRASH_AFTER_CLOSE", None)
+
     print("reopen_pending=", is_reopen_pending())
     print("meta=", load_reopen_pending())
     assert is_reopen_pending(), "flag must remain after crash"
@@ -71,26 +89,15 @@ async def main() -> None:
     print("owner recovers with /open…")
     await call("open", ["0.06"])
     assert money_ops.get_primary_position(), "open after crash failed"
-    set_reopen_pending(False)
-    print("cleared reopen_pending after successful open")
+    assert not is_reopen_pending(), "successful open must clear reopen_pending"
+    print("reopen_pending cleared by successful open")
 
-    print("full rebalance without crash…")
-    set_reopen_pending(False)  # ensure clean; prior failed mid-rebalance left flag
-    # If still pending from failed reopen, clear after verifying capital on wallet
+    print("full rebalance confirm…")
     await call("rebalance", ["confirm"])
-    if is_reopen_pending():
-        print("rebalance left pending — recovering via /open")
-        pos = money_ops.get_primary_position()
-        if not pos:
-            await call("open", ["0.05"])
-        set_reopen_pending(False)
     print("pending after full rebalance=", is_reopen_pending())
     assert not is_reopen_pending()
 
-    print("withdraw confirm…")
-    if money_ops.get_primary_position():
-        await call("withdraw", ["confirm"])
-    print("DONE")
+    print("OK")
 
 
 if __name__ == "__main__":

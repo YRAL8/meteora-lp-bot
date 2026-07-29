@@ -5,6 +5,8 @@ import fs from "fs";
 import path from "path";
 import {
   hasUnresolved,
+  isTransientRpcError,
+  pollSignatureStatus,
   readJournal,
   unresolvedEntries,
   updateJournalBySignature,
@@ -74,6 +76,60 @@ function testJournalUnresolvedBlocks(): void {
   assert(open.length === 1 && open[0].signature === "sigB", "only unknown");
 }
 
+function testTransientClassifier(): void {
+  assert(isTransientRpcError("fetch failed"), "fetch failed");
+  assert(isTransientRpcError("429 Too Many Requests"), "429");
+  assert(isTransientRpcError("ECONNRESET"), "reset");
+  assert(!isTransientRpcError("account not found"), "non-transient");
+}
+
+async function testPollRetriesTransient(): Promise<void> {
+  let calls = 0;
+  const connection = {
+    getSignatureStatuses: async () => {
+      calls++;
+      if (calls < 3) {
+        throw new Error("fetch failed");
+      }
+      return {
+        value: [
+          {
+            err: null,
+            confirmationStatus: "confirmed",
+            slot: 42,
+          },
+        ],
+      };
+    },
+  };
+  const out = await pollSignatureStatus(
+    connection as never,
+    "sigRetry",
+    10_000,
+    10
+  );
+  assert(out.outcome === "confirmed", "recovered after transient");
+  assert(calls >= 3, "retried");
+}
+
+async function testPollUnknownOnlyAfterWindow(): Promise<void> {
+  let calls = 0;
+  const connection = {
+    getSignatureStatuses: async () => {
+      calls++;
+      throw new Error("fetch failed");
+    },
+  };
+  const out = await pollSignatureStatus(
+    connection as never,
+    "sigTimeout",
+    80,
+    20
+  );
+  assert(out.outcome === "unknown", "unknown after window");
+  assert(calls >= 2, "multiple attempts inside window");
+}
+
 function testMainnetGuard(): void {
   const prev = process.env.METEORA_ALLOW_MAINNET;
   delete process.env.METEORA_ALLOW_MAINNET;
@@ -122,9 +178,14 @@ function testNegativeAmounts(): void {
 
 testJournalPendingToConfirmed();
 testJournalUnresolvedBlocks();
+testTransientClassifier();
 testMainnetGuard();
 testParseNetworkDefault();
 testNegativeAmounts();
 
-console.log(`test_logic: passed=${passed} failed=${failed}`);
-process.exit(failed > 0 ? 1 : 0);
+Promise.all([testPollRetriesTransient(), testPollUnknownOnlyAfterWindow()]).then(
+  () => {
+    console.log(`test_logic: passed=${passed} failed=${failed}`);
+    process.exit(failed > 0 ? 1 : 0);
+  }
+);

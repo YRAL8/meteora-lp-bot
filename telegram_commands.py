@@ -1,6 +1,7 @@
 """Telegram command handlers — menu parity with orca-lp-bot + C5 keyboard."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -17,6 +18,7 @@ from telegram.ext import (
 import bot_config
 import bot_state
 import meteora_cycle_journal as cycle_journal
+import meteora_exec
 import meteora_ops
 import money_ops
 import range_state
@@ -98,6 +100,61 @@ def _reply_sync_collector(replies: list[str]):
     return _inner
 
 
+async def _run_money(fn, /, *args, **kwargs):
+    """Run blocking money/RPC work off the asyncio event loop (C8)."""
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+async def _handle_journal_block(update: Update, err: BaseException) -> bool:
+    """If exec failed due to unresolved journal, try resolve and explain in chat."""
+    text = str(err)
+    if "journal has unresolved" not in text.lower() and "unresolved entries" not in text.lower():
+        return False
+    await _reply(
+        update,
+        "⚠️ Журнал транзакций заблокировал денежную операцию. "
+        "Опрашиваю подписи заново…",
+    )
+    try:
+        kw = {
+            "network": money_ops.exec_kwargs().get("network", "devnet"),
+            "rpc": money_ops.exec_kwargs().get("rpc"),
+            "pool": money_ops.exec_kwargs().get("pool"),
+            "extra_env": money_ops.exec_kwargs().get("extra_env"),
+        }
+        result = await _run_money(meteora_exec.resolve_journal, timeout_ms=60_000, **kw)
+    except Exception as e:
+        await _reply(update, f"❌ Не удалось опросить журнал: {e}")
+        return True
+    still = result.get("stillUnresolved") or []
+    cleared = int(result.get("cleared") or 0)
+    if not still:
+        await _reply(
+            update,
+            f"✅ Журнал разрешён (снято записей: {cleared}). Повтори команду.",
+        )
+        return True
+    lines = [
+        f"⚠️ После опроса всё ещё неясно ({len(still)} подпис.). "
+        f"Снято: {cleared}.",
+        "Проверь в обозревателе, затем:",
+        "• /status journal — опросить ещё раз",
+        "• /status journal-forget confirm — снять блок "
+        "(только если на explorer уже видно итог; повторной отправки не будет)",
+        "",
+    ]
+    for u in still[:5]:
+        sig = escape_html(u.get("signature", "?"))
+        st = escape_html(u.get("status", "?"))
+        exp = u.get("explorer") or ""
+        if exp:
+            lines.append(f"• <code>{sig}</code> ({st}) — {escape_html(exp)}")
+        else:
+            lines.append(f"• <code>{sig}</code> ({st})")
+    await _reply(update, "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+    return True
+
+
 async def unauthorized_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -115,12 +172,16 @@ async def register_menu_commands(app: Application) -> None:
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = [a.lower() for a in (context.args or [])]
+    if args and args[0] in ("journal", "journal-forget"):
+        await _journal_status_command(update, context)
+        return
     try:
         owner = money_ops.owner()
         kw = money_ops.ops_kwargs()
-        bal = meteora_ops.balances(owner, **kw)
-        pool = meteora_ops.pool_info(**kw)
-        positions = money_ops.list_open_positions()
+        bal = await _run_money(meteora_ops.balances, owner, **kw)
+        pool = await _run_money(meteora_ops.pool_info, **kw)
+        positions = await _run_money(money_ops.list_open_positions)
         mode = "DEMO" if bot_config.DRY_RUN else "БОЕВОЙ"
         net = bot_config.effective_network()
         sol_ui = (bal.get("sol") or {}).get("ui", 0)
@@ -179,6 +240,66 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         log.exception("Ошибка /status")
         await _reply(update, f"❌ Ошибка /status: {e}")
+
+
+async def _journal_status_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Chat unlock for stuck exec_journal — no new BotCommand (uses /status args)."""
+    args = [a.lower() for a in (context.args or [])]
+    forget = bool(args) and args[0] == "journal-forget"
+    if forget:
+        if len(args) < 2 or args[1] != "confirm":
+            await _reply(
+                update,
+                "Снять блок журнала: /status journal-forget confirm\n"
+                "Только после проверки подписей в explorer. "
+                "Повторной отправки транзакций не будет.",
+            )
+            return
+        result = await _run_money(meteora_exec.forget_unresolved_journal)
+        await _reply(
+            update,
+            f"🔓 Журнал: снято блокирующих записей: {result.get('cleared', 0)}. "
+            "Денежные команды снова можно пробовать.",
+        )
+        return
+
+    await _reply(update, "🔎 Опрашиваю неподтверждённые подписи в журнале…")
+    try:
+        kw = {
+            "network": money_ops.exec_kwargs().get("network", "devnet"),
+            "rpc": money_ops.exec_kwargs().get("rpc"),
+            "pool": money_ops.exec_kwargs().get("pool"),
+            "extra_env": money_ops.exec_kwargs().get("extra_env"),
+        }
+        result = await _run_money(meteora_exec.resolve_journal, timeout_ms=60_000, **kw)
+    except Exception as e:
+        await _reply(update, f"❌ /status journal: {e}")
+        return
+    still = result.get("stillUnresolved") or []
+    cleared = int(result.get("cleared") or 0)
+    if not still:
+        await _reply(
+            update,
+            f"✅ Журнал чист (разрешено за этот опрос: {cleared}).",
+        )
+        return
+    lines = [
+        f"⚠️ Неразрешённых записей: {len(still)} (снято сейчас: {cleared}).",
+        "Повтори /status journal позже или, убедившись в explorer:",
+        "/status journal-forget confirm",
+        "",
+    ]
+    for u in still[:8]:
+        sig = escape_html(u.get("signature", "?"))
+        st = escape_html(u.get("status", "?"))
+        exp = u.get("explorer") or ""
+        lines.append(
+            f"• <code>{sig}</code> ({st})"
+            + (f"\n  {escape_html(exp)}" if exp else "")
+        )
+    await _reply(update, "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
 
 def _market_bucket(efficiency: float | None) -> str:
@@ -422,15 +543,21 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             collector(f"🆕 Открываю новую позицию на ${usdc_amount:.2f} USDC…")
             await flush()
-            money_ops.open_with_budget(usdc_amount, reply=collector)
+            await _run_money(money_ops.open_with_budget, usdc_amount, reply=collector)
             await flush()
         except SwapFailedOpenAborted as e:
             await flush()
             await _reply(update, f"❌ Открытие отменено: {e}")
         except MeteoraExecError as e:
+            await flush()
+            if await _handle_journal_block(update, e):
+                return
             await _reply(update, f"❌ {e}")
         except Exception as e:
             log.exception("/open failed")
+            await flush()
+            if await _handle_journal_block(update, e):
+                return
             await _reply(update, f"❌ Ошибка: {e}")
 
 
@@ -501,22 +628,30 @@ async def addliquidity_command(
             replies.clear()
 
         try:
-            pool = meteora_ops.pool_info(**money_ops.ops_kwargs())
+            pool = await _run_money(meteora_ops.pool_info, **money_ops.ops_kwargs())
             active_id = int(pool["activeId"])
             if not position_in_range(position, active_id):
                 collector(
                     "⚠️ Позиция сейчас ВНЕ диапазона — доливка ляжет в основном в один токен."
                 )
-            money_ops.add_with_budget(position, usdc_amount, reply=collector)
+            await _run_money(
+                money_ops.add_with_budget, position, usdc_amount, reply=collector
+            )
             await flush()
         except SwapFailedOpenAborted:
             # add_with_budget уже отправил одно понятное сообщение с причиной —
             # второе «Доливка отменена: swap failed on add» было техническим дублем.
             await flush()
         except MeteoraExecError as e:
+            await flush()
+            if await _handle_journal_block(update, e):
+                return
             await _reply(update, f"❌ {e}")
         except Exception as e:
             log.exception("/addliquidity failed")
+            await flush()
+            if await _handle_journal_block(update, e):
+                return
             await _reply(update, f"❌ Ошибка: {e}")
 
 
@@ -570,15 +705,26 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             collector("🔒 Закрываю позицию...")
             await flush()
-            money_ops.close_position_full(position, reply=collector, record_cycle=True)
+            await _run_money(
+                money_ops.close_position_full,
+                position,
+                reply=collector,
+                record_cycle=True,
+            )
             await flush()
             await _reply(
                 update, "✅ Позиция закрыта — средства теперь в кошельке бота."
             )
         except MeteoraExecError as e:
+            await flush()
+            if await _handle_journal_block(update, e):
+                return
             await _reply(update, f"❌ {e}")
         except Exception as e:
             log.exception("/withdraw failed")
+            await flush()
+            if await _handle_journal_block(update, e):
+                return
             await _reply(update, f"❌ Ошибка: {e}")
 
 
@@ -591,7 +737,7 @@ async def rebalance_command(
     intentional owner action (same principle as Orca).
 
     Bare /rebalance (and the keyboard button) only shows a confirmation prompt.
-    Run with `/rebalance confirm`. Test hook: `/rebalance crash-after-close`.
+    Run with `/rebalance confirm`.
     """
     if bot_state.bot_frozen:
         await _reply(update, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
@@ -606,24 +752,32 @@ async def rebalance_command(
             update,
             "⚠️ <b>reopen_pending уже стоит</b> — прошлый ребаланс оборвался между "
             f"close и open.\nmeta={meta_s}\n"
-            "Сначала дожми вручную (/open) или сними флаг осознанно.",
+            "Сначала дожми вручную (/open) или /status journal.",
             parse_mode="HTML",
         )
         return
 
     args = [a.lower() for a in (context.args or [])]
-    crash = bool(args) and args[0] in ("crash-after-close", "crash")
+    # Crash hooks removed from Telegram (C8) — use METEORA_CRASH_AFTER_CLOSE=1
+    # from tests/run_rebalance_crash.py only.
+    if args and args[0] in ("crash-after-close", "crash"):
+        await _reply(
+            update,
+            "❌ Тестовый крючок /rebalance crash из чата убран. "
+            "Обычный путь: /rebalance confirm.",
+        )
+        return
     confirmed = bool(args) and args[0] == "confirm"
-    if not confirmed and not crash:
+    if not confirmed:
         try:
-            position = money_ops.get_primary_position()
+            position = await _run_money(money_ops.get_primary_position)
         except Exception as e:
             await _reply(update, f"❌ Не удалось загрузить позицию: {e}")
             return
         if position is None:
             await _reply(update, "❌ Нет открытой позиции для ребаланса.")
             return
-        pool = meteora_ops.pool_info(**money_ops.ops_kwargs())
+        pool = await _run_money(meteora_ops.pool_info, **money_ops.ops_kwargs())
         price = float(pool.get("usdcPerSol") or 0)
         val = money_ops.position_value_usd(position, price)
         cost_est = val * 0.0002  # ~0.02% of position
@@ -644,7 +798,7 @@ async def rebalance_command(
         return
 
     async with bot_state.money_lock:
-        position = money_ops.get_primary_position()
+        position = await _run_money(money_ops.get_primary_position)
         if position is None:
             await _reply(update, "❌ Нет открытой позиции для ребаланса.")
             return
@@ -659,20 +813,29 @@ async def rebalance_command(
         try:
             collector("🔄 Начинаю ручной ребаланс...")
             await flush()
-            money_ops.rebalance_position(
-                position, reply=collector, crash_after_close=crash
+            payload = await _run_money(
+                money_ops.rebalance_position, position, reply=collector
             )
             await flush()
-        except SystemExit:
-            await flush()
-            raise
+            if payload is None or is_reopen_pending():
+                await _reply(
+                    update,
+                    "🚨 Ребаланс НЕ завершён — reopen_pending остаётся. "
+                    "Дожми /open или /status journal.",
+                )
         except SwapFailedOpenAborted as e:
             await flush()
             await _reply(update, f"❌ Ребаланс: реоткрытие отменено: {e}")
         except MeteoraExecError as e:
+            await flush()
+            if await _handle_journal_block(update, e):
+                return
             await _reply(update, f"❌ Ошибка ребаланса: {e}")
         except Exception as e:
             log.exception("/rebalance failed")
+            await flush()
+            if await _handle_journal_block(update, e):
+                return
             await _reply(update, f"❌ Ошибка ребаланса: {e}")
 
 

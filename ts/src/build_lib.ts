@@ -40,8 +40,13 @@ export const DEFAULT_RANGE_HALF = 34; // activeId ± 34 → 69 bins
  * SDK liquidity methods take percent → convert with bps/100 at the call site.
  */
 const DEFAULT_SLIPPAGE_BPS = 100; // 1%
-/** Default priority fee in microlamports per CU. */
-const DEFAULT_PRIORITY_FEE_MICROLAMPORTS = 0;
+/** Default priority fee in microlamports per CU. Overridable via env / --priority-fee. */
+const DEFAULT_PRIORITY_FEE_MICROLAMPORTS = (() => {
+  const raw = process.env.PRIORITY_FEE_MICROLAMPORTS;
+  if (raw === undefined || raw === "") return 50_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 50_000;
+})();
 /** SOL left untouched for future tx fees when reporting balances. */
 const DEFAULT_FEE_RESERVE_SOL = 0.02;
 /** Anchor account discriminator length missing from calculatePositionSize. */

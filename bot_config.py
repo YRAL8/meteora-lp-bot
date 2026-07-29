@@ -65,10 +65,11 @@ REBALANCE_BLOCKED_REMINDER_HOURS = float(
     os.getenv("REBALANCE_BLOCKED_REMINDER_HOURS", "1")
 )
 
-MIN_SOL_BALANCE = float(os.getenv("MIN_SOL_BALANCE", "0.05"))
+MIN_SOL_BALANCE = float(os.getenv("MIN_SOL_BALANCE", "0.08"))
 
 # Cap on position size in USD (open / add / rebalance reopen). Empty = unlimited
 # (wallet≈position model, same as Orca). Set e.g. 50 for safe rehearsals.
+# Required when AUTO_REBALANCE is on AND network is mainnet (see main.py).
 _raw_max_pos = os.getenv("MAX_POSITION_USD", "").strip()
 MAX_POSITION_USD: float | None
 if not _raw_max_pos:
@@ -77,6 +78,11 @@ else:
     MAX_POSITION_USD = float(_raw_max_pos)
     if MAX_POSITION_USD <= 0:
         raise ValueError("MAX_POSITION_USD must be > 0 when set")
+
+# Priority fee (microlamports per CU). Matches ts DEFAULT; passed via --priority-fee.
+PRIORITY_FEE_MICROLAMPORTS = int(os.getenv("PRIORITY_FEE_MICROLAMPORTS", "50000"))
+if PRIORITY_FEE_MICROLAMPORTS < 0:
+    raise ValueError("PRIORITY_FEE_MICROLAMPORTS must be >= 0")
 
 # Payback diagnosis (warn only, never blocks). Swap cost ≈0.02% of position;
 # in-range earn ≈0.0071%/h → payback ≈2.8h. If median cycle life stays below
