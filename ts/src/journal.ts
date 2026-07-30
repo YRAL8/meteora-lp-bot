@@ -18,20 +18,32 @@ export type JournalEntry = {
 
 export const UNRESOLVED_STATUSES: JournalStatus[] = ["pending", "unknown"];
 
-export function defaultJournalPath(projectRoot?: string): string {
+/** Must match Python ``exec_journal_io.JOURNAL_BASENAME`` / ``LOCK_BASENAME``. */
+export const JOURNAL_BASENAME = "exec_journal.jsonl";
+export const LOCK_BASENAME = "exec_journal.lock";
+
+/** Single door for paths — do not invent other lock/journal basenames. */
+export function journalPaths(projectRoot?: string): {
+  journalPath: string;
+  lockPath: string;
+} {
   const envDir = (process.env.METEORA_STATE_DIR || "").trim();
-  if (envDir) {
-    return path.join(envDir, "exec_journal.jsonl");
-  }
-  const root = projectRoot || path.resolve(__dirname, "..", "..");
-  return path.join(root, "state", "exec_journal.jsonl");
+  const dir = envDir
+    ? envDir
+    : path.join(projectRoot || path.resolve(__dirname, "..", ".."), "state");
+  return {
+    journalPath: path.join(dir, JOURNAL_BASENAME),
+    lockPath: path.join(dir, LOCK_BASENAME),
+  };
+}
+
+export function defaultJournalPath(projectRoot?: string): string {
+  return journalPaths(projectRoot).journalPath;
 }
 
 export function journalLockPath(journalPath: string): string {
-  if (journalPath.endsWith(".jsonl")) {
-    return journalPath.slice(0, -".jsonl".length) + ".lock";
-  }
-  return `${journalPath}.lock`;
+  // Sibling lock in the same directory — never `${journalPath}.lock`.
+  return path.join(path.dirname(journalPath), LOCK_BASENAME);
 }
 
 function sleepMs(ms: number): void {

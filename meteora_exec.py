@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import config
+import exec_journal_io
 import state_paths
 
 ROOT = Path(__file__).resolve().parent
@@ -18,35 +19,16 @@ EXEC_JS = ROOT / "ts" / "dist" / "exec.js"
 
 
 def exec_journal_path() -> Path:
-    return state_paths.path("exec_journal.jsonl")
+    return exec_journal_io.journal_path()
 
 
 def exec_journal_lock_path() -> Path:
-    return state_paths.path("exec_journal.lock")
+    return exec_journal_io.lock_path()
 
 
 def list_unresolved_journal() -> List[Dict[str, Any]]:
     """Latest row per signature still pending/unknown (no RPC)."""
-    journal_path = exec_journal_path()
-    if not journal_path.is_file():
-        return []
-    by_sig: Dict[str, Dict[str, Any]] = {}
-    for line in journal_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            e = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        sig = str(e.get("signature") or "")
-        if not sig:
-            continue
-        by_sig[sig] = e
-    return [
-        e
-        for e in by_sig.values()
-        if e.get("status") in ("pending", "unknown")
-    ]
+    return exec_journal_io.list_unresolved()
 
 
 class MeteoraExecError(RuntimeError):
@@ -256,6 +238,7 @@ def exec_close(
     send: bool = False,
     priority_fee: Optional[int] = None,
     force_ignore_journal: bool = False,
+    crash_after_send: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     args = ["exec-close", "--owner", owner, "--position", position]
@@ -263,6 +246,8 @@ def exec_close(
         args.extend(["--priority-fee", str(priority_fee)])
     if force_ignore_journal:
         args.append("--force-ignore-journal")
+    if crash_after_send:
+        args.append("--crash-after-send")
     return run_exec(args, send=send, **kwargs)
 
 
@@ -356,7 +341,7 @@ def forget_unresolved_journal(
     import urllib.request
     from datetime import datetime, timezone
 
-    import journal_lock
+    import exec_journal_io
 
     sig = (signature or "").strip()
     if not sig:
@@ -372,39 +357,19 @@ def forget_unresolved_journal(
         else:
             rpc = os.environ.get("SOLANA_RPC_URL", config.solana_rpc_url())
 
-    journal_path = exec_journal_path()
-    lock_path = exec_journal_lock_path()
+    journal_path = exec_journal_io.journal_path()
     if not journal_path.is_file():
         return {"ok": False, "error": "journal empty", "cleared": 0}
 
     def _read_entries() -> List[Dict[str, Any]]:
-        entries: List[Dict[str, Any]] = []
-        for line in journal_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                entries.append(
-                    {
-                        "signature": "",
-                        "status": "failed",
-                        "error": "corrupt journal line skipped",
-                        "ts": "",
-                    }
-                )
-        return entries
+        return exec_journal_io.read_entries(journal_path)
 
     def _atomic_write(entries: List[Dict[str, Any]]) -> None:
-        body_out = "\n".join(json.dumps(e, ensure_ascii=False) for e in entries)
-        tmp = journal_path.parent / (
-            f"{journal_path.name}.{os.getpid()}."
-            f"{int(datetime.now(timezone.utc).timestamp() * 1000)}.tmp"
-        )
-        tmp.write_text(body_out + ("\n" if body_out else ""), encoding="utf-8")
-        tmp.replace(journal_path)
+        exec_journal_io.write_entries_holding_lock(entries, journal_path)
 
-    journal_lock.acquire_journal_lock(lock_path)
+    # Hold the lock across the RPC poll so a concurrent Node writer cannot
+    # land a pending row that this rewrite would clobber (C12/C13).
+    exec_journal_io.acquire()
     try:
         entries = _read_entries()
 
@@ -540,7 +505,7 @@ def forget_unresolved_journal(
             "age_sec": age_sec,
         }
     finally:
-        journal_lock.release_journal_lock(lock_path)
+        exec_journal_io.release()
 
 
 def main() -> None:

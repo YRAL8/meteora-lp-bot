@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -158,11 +159,7 @@ class JournalForget(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            with patch.object(meteora_exec, "exec_journal_path", lambda: jp), patch.object(
-                meteora_exec,
-                "exec_journal_lock_path",
-                lambda: state / "exec_journal.lock",
-            ):
+            with patch.dict(os.environ, {"METEORA_STATE_DIR": str(state)}):
                 # Confirmed on-chain → refuse
                 with patch("urllib.request.urlopen") as urlopen:
                     class _Resp:
