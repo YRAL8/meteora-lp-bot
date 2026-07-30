@@ -32,8 +32,43 @@ class SwapFailedOpenAborted(RuntimeError):
     """Swap failed and a proportion-correct open was not possible — do not open crooked."""
 
 
+class SwapOutcomeUnknown(RuntimeError):
+    """Swap was signed/sent (or may have been); do not start the next money tx."""
+
+    def __init__(self, err: MeteoraExecError):
+        self.exec_error = err
+        super().__init__(str(err))
+
+
+class OpenMateriallyUndersized(RuntimeError):
+    """Open would be far below the requested budget — not a successful reopen."""
+
+    def __init__(self, requested_usd: float, actual_usd: float):
+        self.requested_usd = requested_usd
+        self.actual_usd = actual_usd
+        super().__init__(
+            f"open undersized: ${actual_usd:.2f} << requested ${requested_usd:.2f}"
+        )
+
+
 class StopRequested(RuntimeError):
     """Owner froze the bot (/stop); do not start the next money transaction."""
+
+
+# Stages from ts fail() that happen before any signature is created.
+_PRE_SIGN_STAGES = frozenset(
+    {
+        "parseArgs",
+        "build",
+        "simulate",
+        "simulation",
+        "journal",
+        "network",
+    }
+)
+
+# Refuse to treat an open as success if wallet scaling cuts below this fraction.
+_OPEN_SUCCESS_MIN_RATIO = 0.85
 
 
 def require_not_frozen(*, reply: Callable[[str], Any], where: str) -> None:
@@ -73,9 +108,31 @@ def _signatures_from_exec_error(err: MeteoraExecError) -> list[str]:
     return out
 
 
-def _close_proven_not_sent(err: MeteoraExecError) -> bool:
-    """True only when the response proves no tx was submitted (no signatures)."""
-    return not _signatures_from_exec_error(err)
+def _exec_proven_not_sent(err: MeteoraExecError) -> bool:
+    """True only when the exec response proves nothing was signed/submitted.
+
+    No signatures is necessary but not sufficient: stage ``send`` without
+    signatures (old fail() shape) still means the tx may be in flight.
+    Only pre-sign stages count as a clean miss. Empty stage + no signatures
+    → clean miss (fail() always sets stage; mocks/legacy omit it).
+    """
+    if _signatures_from_exec_error(err):
+        return False
+    payload = err.payload or {}
+    if payload.get("confirmationUnknown"):
+        return False
+    stage = str(payload.get("stage") or "")
+    if stage in _PRE_SIGN_STAGES:
+        return True
+    if stage in ("send", "confirm", "confirm-unknown", "runtime"):
+        return False
+    if not stage:
+        return True
+    return False
+
+
+# Back-compat alias used by older tests/callers.
+_close_proven_not_sent = _exec_proven_not_sent
 
 
 def _reply_close_outcome_unknown(
@@ -85,7 +142,11 @@ def _reply_close_outcome_unknown(
     detail: str | None = None,
 ) -> None:
     sigs = signatures or []
-    sig_line = ", ".join(sigs[:3]) if sigs else "(подписи в ответе нет — смотри /status journal)"
+    sig_line = (
+        ", ".join(sigs[:3])
+        if sigs
+        else "(подписи в ответе нет — смотри /status journal)"
+    )
     lines = [
         "⚠️ Исход закрытия НЕЯСЕН.",
         "Позиции может уже не быть — деньги могут лежать на кошельке.",
@@ -97,6 +158,32 @@ def _reply_close_outcome_unknown(
         "Автоматика стоит, пока не выясним. "
         "/status journal покажет, есть ли подпись в журнале "
         "(дальше /withdraw confirm при необходимости)."
+    )
+    reply("\n".join(lines))
+
+
+def _reply_money_outcome_unknown(
+    reply: Callable[[str], Any],
+    *,
+    what: str,
+    signatures: list[str] | None = None,
+    detail: str | None = None,
+) -> None:
+    sigs = signatures or []
+    sig_line = (
+        ", ".join(sigs[:3])
+        if sigs
+        else "(подписи в ответе нет — смотри /status journal)"
+    )
+    lines = [
+        f"⚠️ Исход {what} НЕЯСЕН — следующую транзакцию не отправляю.",
+        f"Подпись: <code>{escape_html(sig_line)}</code>",
+    ]
+    if detail:
+        lines.append(f"Деталь: <code>{escape_html(detail)}</code>")
+    lines.append(
+        "Автоматика стоит. Проверь /status journal; "
+        "не открывай новую позицию, пока не убедишься, что старой уже нет."
     )
     reply("\n".join(lines))
 
@@ -225,7 +312,10 @@ def apply_add_cap(
 
 
 def apply_swap_suggestion(suggestion: dict | None, reply: Callable[[str], Any]) -> bool:
-    """Execute swapSuggestion if present. Returns False if swap was needed but failed."""
+    """Execute swapSuggestion if present. Returns False if swap was needed but failed cleanly.
+
+    Unknown/signed outcomes raise SwapOutcomeUnknown — caller must not send the next tx.
+    """
     if not suggestion:
         return True
     side = suggestion.get("side")
@@ -236,8 +326,6 @@ def apply_swap_suggestion(suggestion: dict | None, reply: Callable[[str], Any]) 
     try:
         payload = meteora_exec.exec_swap(owner(), side, amount, **exec_kwargs())
     except MeteoraExecError as e:
-        # Самая частая причина на тонком пуле — нехватка встречной ликвидности;
-        # переводим на человеческий, полный текст всё равно уходит в лог.
         text = str(e)
         human = (
             "в пуле не хватило встречной ликвидности"
@@ -245,9 +333,16 @@ def apply_swap_suggestion(suggestion: dict | None, reply: Callable[[str], Any]) 
             else text
         )
         log.warning("swap failed: %s", text)
-        # reply уходит в Telegram с parse_mode=HTML — экранируем внешний текст.
-        reply(f"своп {human_side} не прошёл: {escape_html(human)}")
-        return False
+        if _exec_proven_not_sent(e):
+            reply(f"своп {human_side} не прошёл: {escape_html(human)}")
+            return False
+        _reply_money_outcome_unknown(
+            reply,
+            what=f"свопа ({human_side})",
+            signatures=_signatures_from_exec_error(e),
+            detail=text[:200],
+        )
+        raise SwapOutcomeUnknown(e) from e
     assert_exec_fully_confirmed(payload)
     reply(f"своп {human_side}: {amount:.6f} ✅")
     price = float(meteora_ops.pool_info(**ops_kwargs()).get("usdcPerSol") or 0)
@@ -374,8 +469,8 @@ def open_with_budget(
     max_bin = int(params.get("maxBinId"))
     price = float(params.get("usdcPerSol") or pool_meta.get("usdcPerSol") or 0)
 
-    require_not_frozen(reply=notes, where="перед свопом при открытии")
-    swap_ok = apply_swap_suggestion(suggestion.get("swapSuggestion"), notes)
+    require_not_frozen(reply=reply, where="перед свопом при открытии")
+    swap_ok = apply_swap_suggestion(suggestion.get("swapSuggestion"), reply)
     _, usdc_have, usable_sol = _wallet_balances()
 
     if not swap_ok:
@@ -399,7 +494,7 @@ def open_with_budget(
                 "❌ Своп не удался, а на кошельке недостаточно средств для "
                 "позиции с правильной пропорцией. Деньги остаются на кошельке; "
                 "не открываю кривую позицию. При ребалансе reopen_pending "
-                "останется — дожми вручную после выравнивания баланса."
+                "останется — сначала /status, убедись что позиции нет, потом /open."
             )
             raise SwapFailedOpenAborted("swap failed; cannot open proportionally")
         notes.add("пересчитал пропорцию под баланс кошелька, без кривой ноги")
@@ -424,6 +519,17 @@ def open_with_budget(
             "Не открываю."
         )
         raise SwapFailedOpenAborted("zero/dust deposit after proportional scale")
+    # Compare to post-cap budget, not the raw request (cap is intentional).
+    if (
+        budget >= _MIN_OPEN_USD
+        and total_usd < budget * _OPEN_SUCCESS_MIN_RATIO
+    ):
+        reply(
+            f"❌ Открытие было бы ~${total_usd:.2f} вместо целевых "
+            f"${budget:.2f} (мало SOL для пропорции). Не открываю и не "
+            f"считаю успехом. Пополни SOL или выведи лишний USDC."
+        )
+        raise OpenMateriallyUndersized(budget, total_usd)
 
     # Одно сообщение вместо цепочки: что открываем и почему сумма отличается.
     head = f"🆕 Открываю позицию на ~${total_usd:.2f}"
@@ -502,7 +608,7 @@ def add_with_budget(
     suggestion = suggest_for_budget(budget, min_bin_id=lo, max_bin_id=hi)
     need_sol = float(suggestion.get("needSol") or 0)
     need_usdc = float(suggestion.get("needUsdc") or 0)
-    swap_ok = apply_swap_suggestion(suggestion.get("swapSuggestion"), notes)
+    swap_ok = apply_swap_suggestion(suggestion.get("swapSuggestion"), reply)
     _, usdc_have, usable_sol = _wallet_balances()
 
     if not swap_ok:
@@ -596,15 +702,26 @@ def close_position_full(
     reply: Callable[[str], Any],
     record_cycle: bool = True,
     trigger: str = "manual",
+    reopen_after_confirm: dict | None = None,
+    price_hint: float | None = None,
 ) -> None:
     """Full close: removeLiquidity+claim+close, or closePositionIfEmpty if empty.
 
     Do NOT withdraw separately first on a live position — that leaves an empty
     account; empty accounts must use exec-close-empty, not removeLiquidity.
+
+    If ``reopen_after_confirm`` is set, write reopen_pending immediately after
+    confirmation — before Telegram replies or cycle-journal side effects.
+
+    ``price_hint`` skips pool_info (pure read) when the caller already priced
+    the position — so a flaky RPC read is not mistaken for an unknown close.
     """
     pk = position["pubkey"]
-    pool = meteora_ops.pool_info(**ops_kwargs())
-    price = float(pool.get("usdcPerSol") or 0)
+    if price_hint is not None:
+        price = float(price_hint)
+    else:
+        pool = meteora_ops.pool_info(**ops_kwargs())
+        price = float(pool.get("usdcPerSol") or 0)
     fees = position.get("fees") or {}
     close_value = position_value_usd(position, price)
     empty = not _position_has_liquidity(position)
@@ -627,6 +744,14 @@ def close_position_full(
         reply("🔒 Закрываю позицию (withdraw 100% + claim + close)…")
         cl = meteora_exec.exec_close(owner(), pk, **exec_kwargs())
     assert_exec_fully_confirmed(cl)
+
+    # Flag first — crash window after confirm must not look like "idle".
+    if reopen_after_confirm is not None:
+        set_reopen_pending(
+            True,
+            meta={**reopen_after_confirm, "close_status": "confirmed"},
+        )
+
     reply(format_exec_replies(cl))
     clear_last_position()
 
@@ -648,12 +773,27 @@ def rebalance_position(
     reopen_pending is set only after a confirmed close, or when close confirmation
     is unknown (must block). A clean close failure leaves the flag unset.
     """
+    import subprocess
+
+    from meteora_ops import MeteoraOpsError
+
     require_max_position_on_mainnet(reply=reply)
+    require_not_frozen(reply=reply, where="перед закрытием при ребалансе")
 
     pk = position["pubkey"]
-    pool = meteora_ops.pool_info(**ops_kwargs())
-    price = float(pool.get("usdcPerSol") or 0)
-    close_value = position_value_usd(position, price)
+    # Pure reads — failures here must NOT set reopen_pending.
+    try:
+        pool = meteora_ops.pool_info(**ops_kwargs())
+        price = float(pool.get("usdcPerSol") or 0)
+        close_value = position_value_usd(position, price)
+    except (MeteoraOpsError, subprocess.TimeoutExpired, RuntimeError, OSError) as e:
+        reply(
+            "❌ Не удалось прочитать пул/позицию перед закрытием — "
+            "позиция на месте, reopen_pending НЕ ставил. Повторю позже.\n"
+            f"Причина: {escape_html(e)}"
+        )
+        raise
+
     trigger = "auto" if auto else "manual"
     pending_meta = {
         "closed_position": pk,
@@ -664,12 +804,25 @@ def rebalance_position(
 
     try:
         close_position_full(
-            position, reply=reply, record_cycle=True, trigger=trigger
+            position,
+            reply=reply,
+            record_cycle=True,
+            trigger=trigger,
+            reopen_after_confirm=pending_meta,
+            price_hint=price,
         )
     except (SystemExit, KeyboardInterrupt):
         raise
+    except MeteoraOpsError as e:
+        # Still in pre-sign prep inside close (pool_info) — position intact.
+        reply(
+            "❌ Подготовка закрытия не прошла — позиция на месте, "
+            "reopen_pending НЕ ставил.\n"
+            f"Причина: {escape_html(e)}"
+        )
+        raise
     except MeteoraExecError as e:
-        if _close_proven_not_sent(e):
+        if _exec_proven_not_sent(e):
             reply(
                 "❌ Закрытие не прошло — позиция на месте, reopen_pending НЕ ставил. "
                 "Ничего дополнительно делать не нужно, можно повторить позже.\n"
@@ -685,12 +838,13 @@ def rebalance_position(
                 "signatures": sigs,
                 "error_type": type(e).__name__,
                 "error": str(e)[:400],
+                "stage": (e.payload or {}).get("stage"),
             },
         )
         _reply_close_outcome_unknown(reply, signatures=sigs, detail=str(e)[:200])
         raise
-    except Exception as e:
-        # Timeout, empty stdout, crash mid-flight — tx may already be in flight.
+    except (subprocess.TimeoutExpired, RuntimeError) as e:
+        # run_exec timeout / empty stdout after (or during) signing path.
         set_reopen_pending(
             True,
             meta={
@@ -708,10 +862,15 @@ def rebalance_position(
         )
         raise
 
-    set_reopen_pending(
-        True,
-        meta={**pending_meta, "close_status": "confirmed"},
-    )
+    # Confirmed close: flag is written inside close_position_full. Ensure it
+    # exists even if a test doubles close without honouring reopen_after_confirm.
+    from reopen_pending import is_reopen_pending as _pending_now
+
+    if not _pending_now():
+        set_reopen_pending(
+            True,
+            meta={**pending_meta, "close_status": "confirmed"},
+        )
 
     if crash_after_close or os.environ.get("METEORA_CRASH_AFTER_CLOSE") == "1":
         reply("💥 crash_after_close: останавливаюсь с reopen_pending")
@@ -723,7 +882,7 @@ def rebalance_position(
         reply(
             "🛑 /stop после закрытия: новую позицию не открываю. "
             "Капитал на кошельке, reopen_pending остаётся. "
-            "Продолжение: /boevoy затем /open."
+            "Продолжение: /boevoy, затем /status (убедись что позиции нет) и /open."
         )
         return None
 
@@ -742,6 +901,26 @@ def rebalance_position(
 
     # Cap applied inside open_with_budget (with announcement); preview here too.
     budget = apply_max_position_cap(budget, reply=reply, action="реоткрываю")
+
+    # SOL leg must cover suggest-amounts needSol for this budget.
+    try:
+        sug = suggest_for_budget(budget)
+        need_sol = float(sug.get("needSol") or 0)
+    except Exception as e:
+        reply(
+            f"❌ Не удалось оценить needSol для реоткрытия: {escape_html(e)}. "
+            "reopen_pending остаётся."
+        )
+        return None
+    if need_sol > 0 and usable_sol + 1e-12 < need_sol:
+        reply(
+            f"❌ После закрытия SOL для открытия мало: "
+            f"solAvailableForOpen={usable_sol:.4f}, needSol≈{need_sol:.4f} "
+            f"под бюджет ~${budget:.2f}. Не открываю урезанную позицию. "
+            f"reopen_pending остаётся — пополни SOL или выведи USDC, потом /open."
+        )
+        return None
+
     reply(f"🔁 Реоткрытие на ~${budget:.2f}…")
     try:
         require_not_frozen(reply=reply, where="перед открытием после закрытия")
@@ -749,13 +928,22 @@ def rebalance_position(
     except StopRequested:
         reply(
             "🛑 /stop: открытие не отправлял. Капитал на кошельке, "
-            "reopen_pending остаётся. /boevoy затем /open."
+            "reopen_pending остаётся. /boevoy затем /status и /open."
+        )
+        return None
+    except SwapOutcomeUnknown:
+        # Message already sent; keep pending, do not clear.
+        return None
+    except OpenMateriallyUndersized as e:
+        reply(
+            f"❌ Реоткрытие не засчитываю: было бы ${e.actual_usd:.2f} "
+            f"вместо ${e.requested_usd:.2f}. reopen_pending остаётся."
         )
         return None
     except SwapFailedOpenAborted as e:
         reply(
             f"❌ Реоткрытие отменено ({e}). reopen_pending остаётся — "
-            "выровняй кошелёк и дожми /open или /rebalance confirm."
+            "выровняй кошелёк; /status затем /open или /rebalance confirm."
         )
         return None
     set_reopen_pending(False)

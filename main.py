@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import auto_rebalance_limits as ar_limits
 import bot_config
@@ -9,7 +11,9 @@ import bot_state
 import meteora_cycle_journal as cycle_journal
 import meteora_ops
 import money_ops
+import monitor_timer_state
 import range_state
+import state_volume
 import telegram_commands as tg
 import telegram_notify
 from reopen_pending import is_reopen_pending, load_reopen_pending
@@ -32,6 +36,35 @@ out_of_range_since: Optional[datetime] = None
 last_auto_attempt_at: Optional[datetime] = None
 rebalance_blocked_alert_sent = False
 rebalance_blocked_last_alert_at: Optional[datetime] = None
+
+
+def _persist_timers() -> None:
+    monitor_timer_state.save_timers(out_of_range_since, last_auto_attempt_at)
+
+
+def _rpc_host_for_log(rpc_url: str) -> str:
+    try:
+        return urlparse(rpc_url).hostname or "(rpc)"
+    except Exception:
+        return "(rpc)"
+
+
+def _assert_mainnet_rpc_explicit() -> None:
+    """Refuse silent public-mainnet RPC (produces unknown outcomes)."""
+    if bot_config.effective_network() != "mainnet":
+        return
+    raw = os.environ.get("SOLANA_RPC_URL", "").strip()
+    if not raw:
+        raise SystemExit(
+            "mainnet requires explicit SOLANA_RPC_URL in .env "
+            "(public api.mainnet-beta.solana.com is not allowed)"
+        )
+    host = (_rpc_host_for_log(raw) or "").lower()
+    if host in ("api.mainnet-beta.solana.com", "solana-api.projectserum.com"):
+        raise SystemExit(
+            f"mainnet SOLANA_RPC_URL points at public host {host} — "
+            "set a private/provider URL"
+        )
 
 
 def _reset_rebalance_blocked_state() -> None:
@@ -132,9 +165,11 @@ async def monitor_position(*, now: datetime | None = None) -> None:
             if _should_send_blocked_reminder(now):
                 send_telegram_message(
                     "⚠️ <b>reopen_pending</b> — авто-ребаланс не стартует.\n"
-                    "Капитал на кошельке после оборванного close→open.\n"
+                    "Капитал возможно на кошельке после оборванного close→open.\n"
                     f"<code>{escape_html(str(meta)[:400])}</code>\n"
-                    "Дожми /open вручную или /status journal."
+                    "Сначала /status (есть ли позиция). "
+                    "Если позиции нет — /open; иначе не открывай вторую. "
+                    "Журнал: /status journal."
                 )
                 _mark_blocked_reminder_sent(now)
             log.warning("reopen_pending — пропускаю авто-ребаланс")
@@ -192,12 +227,14 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                 )
             out_of_range_since = None
             last_auto_attempt_at = None
+            _persist_timers()
             _reset_rebalance_blocked_state()
             return
 
         # --- out of range ---
         if out_of_range_since is None:
             out_of_range_since = now
+            _persist_timers()
             _reset_rebalance_blocked_state()
             since_str = out_of_range_since.replace(microsecond=0).isoformat()
             log.warning(
@@ -273,6 +310,7 @@ async def monitor_position(*, now: datetime | None = None) -> None:
             log.info("Цена вернулась после выдержки — ребаланс отменён")
             out_of_range_since = None
             last_auto_attempt_at = None
+            _persist_timers()
             _reset_rebalance_blocked_state()
             send_telegram_message(
                 f"✅ <b>Цена вернулась — авто-ребаланс отменён</b>\n"
@@ -312,29 +350,56 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                 log.warning("MAX_REBALANCES_PER_DAY reached — auto paused for today")
             return
 
-        # Low SOL: same number open uses (rent + fee reserve already subtracted)
+        # Low SOL: compare available to needSol for the intended reopen budget
+        # (not merely > 0). Estimate post-close wallet ≈ current + position legs.
         bal = meteora_ops.balances(owner, **kw)
         sol_ui = float((bal.get("sol") or {}).get("ui") or 0)
+        usdc_ui = float((bal.get("usdc") or {}).get("ui") or 0)
         sao = bal.get("solAvailableForOpen")
         if sao is not None:
             usable_sol = max(0.0, float(sao))
         else:
             usable_sol = max(0.0, sol_ui - bot_config.MIN_SOL_BALANCE)
-        if usable_sol <= 0:
+        pos_sol = float(pos.get("sol") or 0)
+        pos_usdc = float(pos.get("usdc") or 0)
+        est_sol = usable_sol + pos_sol
+        est_usdc = usdc_ui + pos_usdc
+        est_budget = (est_sol * price2 + est_usdc) * 0.98
+        if bot_config.MAX_POSITION_USD is not None:
+            est_budget = min(est_budget, float(bot_config.MAX_POSITION_USD))
+        need_sol: float | None = None
+        if est_budget >= 0.05:
+            try:
+                sug = money_ops.suggest_for_budget(est_budget)
+                need_sol = float(sug.get("needSol") or 0)
+            except Exception:
+                log.warning(
+                    "suggest-amounts for SOL gate failed — fallback usable_sol>0",
+                    exc_info=True,
+                )
+        short_sol = False
+        if need_sol is not None:
+            short_sol = est_sol + 1e-12 < need_sol or est_budget < 0.05
+        else:
+            # Degraded: cannot price needSol (offline tests / RPC blip).
+            short_sol = usable_sol <= 0 or est_budget < 0.05
+        if short_sol:
             if _should_send_blocked_reminder(now):
+                need_s = f"{need_sol:.4f}" if need_sol is not None else "?"
                 send_telegram_message(
-                    f"⚠️ <b>Авто-ребаланс отложен — мало SOL для открытия</b>\n"
-                    f"solAvailableForOpen={usable_sol:.4f} "
-                    f"(баланс {sol_ui:.4f}, MIN_SOL_BALANCE="
-                    f"{bot_config.MIN_SOL_BALANCE}).\n"
+                    f"⚠️ <b>Авто-ребаланс отложен — мало SOL под пропорцию</b>\n"
+                    f"оценка после close: SOL≈{est_sol:.4f}, needSol≈{need_s}, "
+                    f"бюджет≈${est_budget:.2f} "
+                    f"(сейчас solAvailableForOpen={usable_sol:.4f}).\n"
                     f"Вне диапазона уже {minutes_out:.0f} мин. "
                     f"Таймер не сброшен — повторю на следующем тике."
                 )
                 _mark_blocked_reminder_sent(now)
             log.warning(
-                "Мало SOL для открытия usable=%.4f sol=%.4f — ребаланс отложен",
-                usable_sol,
-                sol_ui,
+                "Мало SOL под needSol est_sol=%.4f need=%s budget=%.2f — отложен",
+                est_sol,
+                need_sol,
+                est_budget,
             )
             return
 
@@ -362,6 +427,7 @@ async def monitor_position(*, now: datetime | None = None) -> None:
 
         # Act — do NOT clear out_of_range_since until success
         last_auto_attempt_at = now
+        _persist_timers()
         lo_now, hi_now = _price_bounds(pos, active2, price2, int(pool2["binStep"]))
         start_msg = (
             f"🤖 <b>Авто-ребаланс</b>\n"
@@ -379,6 +445,12 @@ async def monitor_position(*, now: datetime | None = None) -> None:
         collector = _tg_reply_collector(replies)
         async with bot_state.money_lock:
             # Fresh read inside lock (Orca M1 lesson).
+            if bot_state.bot_frozen:
+                log.warning("/stop под локом — abort auto до закрытия")
+                send_telegram_message(
+                    "🛑 Авто-ребаланс не начинал закрытие — бот заморожен (/stop)."
+                )
+                return
             if is_reopen_pending():
                 log.warning("reopen_pending появился под локом — abort auto")
                 return
@@ -413,7 +485,8 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                         "<code>reopen_pending</code> остаётся.\n"
                         f"meta={escape_html(str(meta)[:400])}\n"
                         "Суточный лимит НЕ засчитан. "
-                        "Дожми /open вручную или /status journal."
+                        "/status (есть ли позиция); /open только если её нет. "
+                        "Журнал: /status journal."
                     )
                     log.warning(
                         "Авто-ребаланс aborted (payload=%s pending=%s) — не success",
@@ -423,6 +496,7 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                     return
                 out_of_range_since = None
                 last_auto_attempt_at = None
+                _persist_timers()
                 ar_limits.record_rebalance(lim, now)
                 _reset_rebalance_blocked_state()
                 send_telegram_message("✅ Авто-ребаланс завершён.")
@@ -441,10 +515,19 @@ async def monitor_position(*, now: datetime | None = None) -> None:
 
 
 async def main() -> None:
+    global out_of_range_since, last_auto_attempt_at
+
+    _assert_mainnet_rpc_explicit()
+    persistent, state_line = state_volume.ensure_state_dir()
+    out_of_range_since, last_auto_attempt_at = monitor_timer_state.load_timers()
+
+    rpc_url = bot_config.effective_rpc()
+    rpc_host = _rpc_host_for_log(rpc_url)
+
     log.info("=" * 50)
     log.info(
         "Meteora LP-бот | DRY_RUN=%s network=%s AUTO_REBALANCE=%s "
-        "DELAY=%smin INTERVAL=%smin MAX/day=%s pool=%s",
+        "DELAY=%smin INTERVAL=%smin MAX/day=%s pool=%s rpc=%s",
         bot_config.DRY_RUN,
         bot_config.effective_network(),
         bot_config.AUTO_REBALANCE,
@@ -452,7 +535,15 @@ async def main() -> None:
         bot_config.MIN_REBALANCE_INTERVAL_MIN,
         bot_config.MAX_REBALANCES_PER_DAY,
         bot_config.pool_pubkey(),
+        rpc_host,
     )
+    log.info("state: %s", state_line)
+    if out_of_range_since or last_auto_attempt_at:
+        log.info(
+            "restored timers out_of_range_since=%s last_auto_attempt_at=%s",
+            out_of_range_since,
+            last_auto_attempt_at,
+        )
     log.info("=" * 50)
 
     if is_reopen_pending():
@@ -462,8 +553,9 @@ async def main() -> None:
             "⚠️ <b>ВНИМАНИЕ: reopen_pending</b>\n"
             "Прошлый ребаланс оборвался между закрытием и открытием.\n"
             f"<code>{escape_html(str(meta)[:400])}</code>\n"
-            "Капитал на кошельке. Дожми /open или /status journal — "
-            "бот НЕ будет молча продолжать как ни в чём не бывало."
+            "Сначала /status (есть ли позиция). "
+            "Если позиции нет — /open; иначе не открывай вторую. "
+            "Журнал: /status journal."
         )
 
     if (
@@ -501,9 +593,17 @@ async def main() -> None:
         if bot_config.AUTO_REBALANCE
         else "только наблюдение (AUTO_REBALANCE=off)"
     )
+    state_warn = (
+        ""
+        if persistent
+        else "\n⚠️ state/ без маркера — смонтируй том /app/state"
+    )
     send_telegram_message(
         f"🤖 <b>Meteora LP-бот запущен</b>\n"
         f"Режим: {mode} · сеть: {bot_config.effective_network()}\n"
+        f"RPC: <code>{escape_html(rpc_host)}</code>\n"
+        f"Состояние: {escape_html(state_line)}"
+        f"{state_warn}\n"
         f"{auto_line} · выдержка {bot_config.REBALANCE_DELAY_MIN} мин\n"
         f"Пул: <code>{bot_config.pool_pubkey()}</code>\n"
         f"Опрос: {bot_config.POLL_INTERVAL_SEC} сек\n"

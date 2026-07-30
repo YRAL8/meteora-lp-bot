@@ -81,9 +81,14 @@ export function rpcHostForLog(rpc: string): string {
   }
 }
 
-export function fail(action: string, error: string, stage: string): never {
+export function fail(
+  action: string,
+  error: string,
+  stage: string,
+  extra?: Record<string, unknown>
+): never {
   process.stdout.write(
-    JSON.stringify({ ok: false, action, error, stage }) + "\n"
+    JSON.stringify({ ok: false, action, error, stage, ...(extra || {}) }) + "\n"
   );
   process.exit(1);
 }
@@ -1169,13 +1174,23 @@ export async function cmdBuildClose(
     })
   );
 
+  const txArr = toTxArray(txs);
+  if (txArr.length > 1) {
+    fail(
+      action,
+      `close produced ${txArr.length} transactions; refusing multi-tx close ` +
+        `(partial close is unsafe). Narrow the range or close manually.`,
+      "build"
+    );
+  }
+
   return finalizeBuild(
     connection,
     action,
     owner,
     pool,
     { position: positionStr, priorityFeeMicrolamports: priorityFee },
-    toTxArray(txs),
+    txArr,
     [
       "SDK method: removeLiquidity with bps=10000 and shouldClaimAndClose=true (withdraw 100% + claim fees + close)",
       `bins [${lowerBinId}, ${upperBinId}]`,

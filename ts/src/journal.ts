@@ -31,7 +31,11 @@ export function readJournal(journalPath: string): JournalEntry[] {
   const entries: JournalEntry[] = [];
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
-    entries.push(JSON.parse(line) as JournalEntry);
+    try {
+      entries.push(JSON.parse(line) as JournalEntry);
+    } catch {
+      // Skip corrupt lines — must not break resolve/forget (C10).
+    }
   }
   return entries;
 }
@@ -40,7 +44,9 @@ export function writeJournal(journalPath: string, entries: JournalEntry[]): void
   const dir = path.dirname(journalPath);
   fs.mkdirSync(dir, { recursive: true });
   const body = entries.map((e) => JSON.stringify(e)).join("\n");
-  fs.writeFileSync(journalPath, body ? body + "\n" : "", "utf8");
+  const tmp = `${journalPath}.tmp`;
+  fs.writeFileSync(tmp, body ? body + "\n" : "", "utf8");
+  fs.renameSync(tmp, journalPath);
 }
 
 export function appendJournalEntry(

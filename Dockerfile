@@ -29,6 +29,10 @@ RUN useradd --create-home --uid 1000 appuser \
 
 USER appuser
 
+# Persisted bot state: reopen_pending, exec journal, auto-rebalance counters,
+# monitor timers. Must be mounted (-v …:/app/state) or a recreate wipes C8–C10.
+VOLUME ["/app/state"]
+
 # .env читается через python-dotenv из рабочей директории; WALLET_KEYPAIR_PATH
 # монтируется отдельным volume (см. docker run/compose) — секрет не входит в образ.
 CMD ["python", "-u", "main.py"]

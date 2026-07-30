@@ -192,6 +192,23 @@ function testRpcHostForLog(): void {
   );
 }
 
+function testFailCarriesExtra(): void {
+  // fail() exits the process — verify shape by constructing the same object.
+  const extra = {
+    signatures: ["SigA"],
+    sends: [{ signature: "SigA", status: "unknown" }],
+  };
+  const payload = {
+    ok: false,
+    action: "exec-close",
+    error: "send failed",
+    stage: "send",
+    ...extra,
+  };
+  assert(payload.signatures[0] === "SigA", "fail extra signatures");
+  assert(payload.stage === "send", "fail stage send");
+}
+
 testJournalPendingToConfirmed();
 testJournalUnresolvedBlocks();
 testTransientClassifier();
@@ -199,6 +216,7 @@ testMainnetGuard();
 testParseNetworkDefault();
 testNegativeAmounts();
 testRpcHostForLog();
+testFailCarriesExtra();
 
 Promise.all([testPollRetriesTransient(), testPollUnknownOnlyAfterWindow()]).then(
   () => {

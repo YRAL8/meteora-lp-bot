@@ -196,11 +196,31 @@ async function sendBuildResult(
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // Client send error ≠ proof the cluster rejected the tx (skipPreflight).
+      // Leave unresolved so the journal still blocks the next send.
       updateJournalBySignature(journalPath, signature, {
-        status: "failed",
-        error: msg,
+        status: "unknown",
+        error: `send exception (may still land): ${msg}`,
       });
-      fail(action, `send failed tx[${txMeta.index}]: ${msg}`, "send");
+      const sendsSoFar = [
+        ...sends,
+        {
+          index: txMeta.index,
+          signature,
+          status: "unknown",
+          slot: null,
+          explorer: explorerTxUrl(signature, network),
+          error: msg,
+        },
+      ];
+      const sigsSoFar = [...signatures, signature];
+      fail(action, `send failed tx[${txMeta.index}]: ${msg}`, "send", {
+        confirmationUnknown: true,
+        network,
+        signatures: sigsSoFar,
+        sends: sendsSoFar,
+        params,
+      });
     }
 
     if (opts?.crashAfterSend) {
@@ -238,7 +258,13 @@ async function sendBuildResult(
       fail(
         action,
         `tx[${txMeta.index}] failed on-chain: ${error}`,
-        "confirm"
+        "confirm",
+        {
+          network,
+          signatures,
+          sends,
+          params,
+        }
       );
     }
     if (status === "unknown") {
@@ -248,20 +274,18 @@ async function sendBuildResult(
         `tx[${txMeta.index}] confirmation unknown — failing this exec; ` +
           "journal left as unknown; do not retry blindly"
       );
-      process.stdout.write(
-        JSON.stringify({
-          ok: false,
-          action,
-          error: `tx[${txMeta.index}] confirmation unknown — do not retry blindly`,
-          stage: "confirm-unknown",
+      fail(
+        action,
+        `tx[${txMeta.index}] confirmation unknown — do not retry blindly`,
+        "confirm-unknown",
+        {
           confirmationUnknown: true,
           network,
           signatures,
           sends,
           params,
-        }) + "\n"
+        }
       );
-      process.exit(1);
     }
     await sleep(500);
   }

@@ -687,6 +687,14 @@ async def addliquidity_command(
                 collector(
                     "⚠️ Позиция сейчас ВНЕ диапазона — доливка ляжет в основном в один токен."
                 )
+            half = range_state.current_half_width()
+            if half > 34:
+                collector(
+                    f"⚠️ Широкий диапазон (half={half}): долив может потребовать "
+                    "нескольких транзакций. Поздние части могут сорваться на "
+                    "просроченном blockhash — часть денег войдёт, часть нет. "
+                    "Узкий диапазон (/setrange) безопаснее."
+                )
             await _run_money(
                 money_ops.add_with_budget, position, usdc_amount, reply=collector
             )
@@ -734,14 +742,8 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    # Clear reopen_pending — intentional withdraw, do not auto-reopen.
-    from reopen_pending import set_reopen_pending
-
-    try:
-        set_reopen_pending(False)
-    except Exception:
-        log.exception("Не удалось снять reopen_pending при /withdraw")
-
+    # Clear reopen_pending only after a confirmed close — never before the lock
+    # or the exec (audit C10: early clear left capital invisible).
     if bot_state.money_lock.locked():
         await _reply(update, "⏳ Идёт другая денежная операция — подожди.")
         return
@@ -763,10 +765,19 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 position,
                 reply=collector,
                 record_cycle=True,
+                trigger="manual",
             )
             await flush()
+            from reopen_pending import set_reopen_pending
+
+            try:
+                set_reopen_pending(False)
+            except Exception:
+                log.exception("Не удалось снять reopen_pending после /withdraw")
             await _reply(
-                update, "✅ Позиция закрыта — средства теперь в кошельке бота."
+                update,
+                "✅ Позиция закрыта — средства в кошельке бота. "
+                "reopen_pending снят (если был).",
             )
         except MeteoraExecError as e:
             await flush()
@@ -895,11 +906,25 @@ async def rebalance_command(
                 await _reply(
                     update,
                     "🚨 Ребаланс НЕ завершён — reopen_pending остаётся. "
-                    "Дожми /open или /status journal.",
+                    "/status (есть ли позиция), затем /open только если позиции нет. "
+                    "Журнал: /status journal.",
                 )
         except SwapFailedOpenAborted as e:
             await flush()
             await _reply(update, f"❌ Ребаланс: реоткрытие отменено: {e}")
+        except money_ops.SwapOutcomeUnknown as e:
+            await flush()
+            await _reply(
+                update,
+                f"⚠️ Своп с неясным исходом — дальше не шёл. {e}",
+            )
+        except money_ops.OpenMateriallyUndersized as e:
+            await flush()
+            await _reply(
+                update,
+                f"❌ Реоткрытие урезано слишком сильно "
+                f"(${e.actual_usd:.2f} vs ${e.requested_usd:.2f}) — не успех.",
+            )
         except money_ops.StopRequested:
             await flush()
             await _reply(

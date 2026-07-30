@@ -312,7 +312,9 @@ def forget_unresolved_journal(
     """Mark one unresolved journal signature as failed after an RPC poll.
 
     Mass forget is intentionally removed (C9). Does NOT send transactions.
+    Writes under a file lock via temp+replace (C10).
     """
+    import fcntl
     import urllib.error
     import urllib.request
     from datetime import datetime, timezone
@@ -332,150 +334,171 @@ def forget_unresolved_journal(
             rpc = os.environ.get("SOLANA_RPC_URL", config.solana_rpc_url())
 
     journal_path = ROOT / "state" / "exec_journal.jsonl"
+    lock_path = ROOT / "state" / "exec_journal.lock"
     if not journal_path.is_file():
         return {"ok": False, "error": "journal empty", "cleared": 0}
 
-    lines = journal_path.read_text(encoding="utf-8").splitlines()
-    entries: List[Dict[str, Any]] = []
-    for line in lines:
-        if not line.strip():
-            continue
-        entries.append(json.loads(line))
+    def _read_entries() -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for line in journal_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                # Corrupt line — keep a stub so rewrite does not drop neighbours.
+                entries.append(
+                    {
+                        "signature": "",
+                        "status": "failed",
+                        "error": "corrupt journal line skipped",
+                        "ts": "",
+                    }
+                )
+        return entries
 
-    target: Optional[Dict[str, Any]] = None
-    target_idx = -1
-    for i in range(len(entries) - 1, -1, -1):
-        if str(entries[i].get("signature")) == sig:
-            target = entries[i]
-            target_idx = i
-            break
-    if target is None:
-        return {
-            "ok": False,
-            "error": f"signature not in journal: {sig}",
-            "cleared": 0,
-        }
-    if target.get("status") not in ("pending", "unknown"):
-        return {
-            "ok": False,
-            "error": f"signature status is {target.get('status')!r}, not unresolved",
-            "cleared": 0,
-            "status": target.get("status"),
-        }
+    def _atomic_write(entries: List[Dict[str, Any]]) -> None:
+        body_out = "\n".join(json.dumps(e, ensure_ascii=False) for e in entries)
+        tmp = journal_path.with_suffix(".jsonl.tmp")
+        tmp.write_text(body_out + ("\n" if body_out else ""), encoding="utf-8")
+        tmp.replace(journal_path)
 
-    # Poll RPC before trusting the owner.
-    body = json.dumps(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getSignatureStatuses",
-            "params": [[sig], {"searchTransactionHistory": True}],
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        rpc,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-        return {
-            "ok": False,
-            "error": f"RPC unavailable: {exc}",
-            "cleared": 0,
-            "refuse": "rpc",
-        }
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        entries = _read_entries()
 
-    if raw.get("error"):
-        return {
-            "ok": False,
-            "error": f"RPC error: {raw['error']}",
-            "cleared": 0,
-            "refuse": "rpc",
-        }
-
-    st = (raw.get("result") or {}).get("value") or [None]
-    st0 = st[0] if st else None
-    if st0 is not None:
-        if st0.get("err"):
-            # On-chain failure — safe to mark failed and unblock.
-            entries[target_idx] = {
-                **target,
-                "status": "failed",
-                "error": f"{reason}; on-chain err={json.dumps(st0.get('err'))}",
-            }
-            body_out = "\n".join(json.dumps(e, ensure_ascii=False) for e in entries)
-            journal_path.write_text(body_out + ("\n" if body_out else ""), encoding="utf-8")
-            return {
-                "ok": True,
-                "cleared": 1,
-                "signature": sig,
-                "outcome": "failed_on_chain",
-            }
-        conf = st0.get("confirmationStatus")
-        if conf in ("confirmed", "finalized"):
+        target: Optional[Dict[str, Any]] = None
+        target_idx = -1
+        for i in range(len(entries) - 1, -1, -1):
+            if str(entries[i].get("signature")) == sig:
+                target = entries[i]
+                target_idx = i
+                break
+        if target is None:
             return {
                 "ok": False,
-                "error": "signature is confirmed on-chain — resolve, do not forget",
+                "error": f"signature not in journal: {sig}",
                 "cleared": 0,
-                "refuse": "confirmed",
-                "signature": sig,
-                "confirmationStatus": conf,
-                "slot": st0.get("slot"),
             }
-        # processed / still landing
-        return {
-            "ok": False,
-            "error": f"signature still in flight ({conf or 'unknown status'}) — retry later",
-            "cleared": 0,
-            "refuse": "processing",
-            "signature": sig,
-        }
+        if target.get("status") not in ("pending", "unknown"):
+            return {
+                "ok": False,
+                "error": f"signature status is {target.get('status')!r}, not unresolved",
+                "cleared": 0,
+                "status": target.get("status"),
+            }
 
-    # Not found on RPC — only allow forget after confirm window from journal ts.
-    age_sec = None
-    ts = target.get("ts")
-    if ts:
+        # Poll RPC before trusting the owner.
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSignatureStatuses",
+                "params": [[sig], {"searchTransactionHistory": True}],
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            rpc,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         try:
-            s = str(ts)
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            sent_at = datetime.fromisoformat(s)
-            if sent_at.tzinfo is None:
-                sent_at = sent_at.replace(tzinfo=timezone.utc)
-            age_sec = (datetime.now(timezone.utc) - sent_at.astimezone(timezone.utc)).total_seconds()
-        except ValueError:
-            age_sec = None
-    if age_sec is None or age_sec < confirm_window_sec:
-        return {
-            "ok": False,
-            "error": (
-                "signature not found yet and confirm window not elapsed — retry later"
-            ),
-            "cleared": 0,
-            "refuse": "processing",
-            "signature": sig,
-            "age_sec": age_sec,
-            "confirm_window_sec": confirm_window_sec,
-        }
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            return {
+                "ok": False,
+                "error": f"RPC unavailable: {exc}",
+                "cleared": 0,
+                "refuse": "rpc",
+            }
 
-    entries[target_idx] = {
-        **target,
-        "status": "failed",
-        "error": f"{reason}; not found after {age_sec:.0f}s",
-    }
-    body_out = "\n".join(json.dumps(e, ensure_ascii=False) for e in entries)
-    journal_path.write_text(body_out + ("\n" if body_out else ""), encoding="utf-8")
-    return {
-        "ok": True,
-        "cleared": 1,
-        "signature": sig,
-        "outcome": "not_found_expired",
-        "age_sec": age_sec,
-    }
+        if raw.get("error"):
+            return {
+                "ok": False,
+                "error": f"RPC error: {raw['error']}",
+                "cleared": 0,
+                "refuse": "rpc",
+            }
+
+        st = (raw.get("result") or {}).get("value") or [None]
+        st0 = st[0] if st else None
+        if st0 is not None:
+            if st0.get("err"):
+                entries[target_idx] = {
+                    **target,
+                    "status": "failed",
+                    "error": f"{reason}; on-chain err={json.dumps(st0.get('err'))}",
+                }
+                _atomic_write(entries)
+                return {
+                    "ok": True,
+                    "cleared": 1,
+                    "signature": sig,
+                    "outcome": "failed_on_chain",
+                }
+            conf = st0.get("confirmationStatus")
+            if conf in ("confirmed", "finalized"):
+                return {
+                    "ok": False,
+                    "error": "signature is confirmed on-chain — resolve, do not forget",
+                    "cleared": 0,
+                    "refuse": "confirmed",
+                    "signature": sig,
+                    "confirmationStatus": conf,
+                    "slot": st0.get("slot"),
+                }
+            return {
+                "ok": False,
+                "error": f"signature still in flight ({conf or 'unknown status'}) — retry later",
+                "cleared": 0,
+                "refuse": "processing",
+                "signature": sig,
+            }
+
+        age_sec = None
+        ts = target.get("ts")
+        if ts:
+            try:
+                s = str(ts)
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                sent_at = datetime.fromisoformat(s)
+                if sent_at.tzinfo is None:
+                    sent_at = sent_at.replace(tzinfo=timezone.utc)
+                age_sec = (
+                    datetime.now(timezone.utc) - sent_at.astimezone(timezone.utc)
+                ).total_seconds()
+            except ValueError:
+                age_sec = None
+        if age_sec is None or age_sec < confirm_window_sec:
+            return {
+                "ok": False,
+                "error": (
+                    "signature not found yet and confirm window not elapsed — retry later"
+                ),
+                "cleared": 0,
+                "refuse": "processing",
+                "signature": sig,
+                "age_sec": age_sec,
+                "confirm_window_sec": confirm_window_sec,
+            }
+
+        entries[target_idx] = {
+            **target,
+            "status": "failed",
+            "error": f"{reason}; not found after {age_sec:.0f}s",
+        }
+        _atomic_write(entries)
+        return {
+            "ok": True,
+            "cleared": 1,
+            "signature": sig,
+            "outcome": "not_found_expired",
+            "age_sec": age_sec,
+        }
 
 
 def main() -> None:
