@@ -2,14 +2,21 @@
 """Offline tests for C7: HTML escaping and /pnl length limit."""
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
+os.environ["WALLET_KEYPAIR_PATH"] = str(
+    ROOT / "tests" / "fixtures" / "offline_keypair.json"
+)
 sys.path.insert(0, str(ROOT))
 
+import bot_config  # noqa: E402
+
+bot_config.WALLET_KEYPAIR_PATH = os.environ["WALLET_KEYPAIR_PATH"]
 import money_ops  # noqa: E402
 import telegram_commands as tg  # noqa: E402
 from meteora_exec import MeteoraExecError  # noqa: E402

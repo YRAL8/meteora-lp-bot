@@ -55,24 +55,26 @@ class AutoRebalanceState:
             # daily_limit_notified_day stays — compared against today's key
 
 
-def load_state(path: Path | None = None) -> AutoRebalanceState:
+def load_state(
+    path: Path | None = None, *, now: datetime | None = None
+) -> AutoRebalanceState:
     p = path or STATE_PATH
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        st = AutoRebalanceState(day_utc=_day_key())
+        st = AutoRebalanceState(day_utc=_day_key(now))
         return st
     except Exception:
         log.warning("auto_rebalance state unreadable — starting fresh", exc_info=True)
-        return AutoRebalanceState(day_utc=_day_key())
+        return AutoRebalanceState(day_utc=_day_key(now))
     st = AutoRebalanceState(
-        day_utc=str(raw.get("day_utc") or _day_key()),
+        day_utc=str(raw.get("day_utc") or _day_key(now)),
         count_today=int(raw.get("count_today") or 0),
         last_rebalance_at=raw.get("last_rebalance_at"),
         daily_limit_notified_day=raw.get("daily_limit_notified_day"),
         uneconomic_warned_at=raw.get("uneconomic_warned_at"),
     )
-    st.ensure_day()
+    st.ensure_day(now)
     return st
 
 

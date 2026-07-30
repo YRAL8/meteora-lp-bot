@@ -77,7 +77,7 @@ def _maybe_warn_uneconomic(pos: dict, usdc_per_sol: float) -> None:
     payback = bot_config.REBALANCE_PAYBACK_HOURS
     if median >= payback:
         return
-    st = ar_limits.load_state()
+    st = ar_limits.load_state(now=datetime.now(timezone.utc))
     if not ar_limits.should_warn_uneconomic(
         st, reminder_hours=bot_config.REBALANCE_BLOCKED_REMINDER_HOURS
     ):
@@ -279,7 +279,7 @@ async def monitor_position(*, now: datetime | None = None) -> None:
             return
 
         # Storm guard: min interval
-        lim = ar_limits.load_state()
+        lim = ar_limits.load_state(now=now)
         lim.ensure_day(now)
         since_last = ar_limits.minutes_since_last(lim, now)
         if (

@@ -43,6 +43,7 @@ def _pool(*, active: int = 105, price: float = 100.0, bin_step: int = 1) -> dict
 class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         main_mod.out_of_range_since = None
+        main_mod.last_auto_attempt_at = None
         main_mod._reset_rebalance_blocked_state()
         bot_state.bot_paused = False
         bot_state.bot_frozen = False
@@ -55,7 +56,7 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot_config, "MIN_REBALANCE_INTERVAL_MIN", 60),
             patch.object(bot_config, "MAX_REBALANCES_PER_DAY", 6),
             patch.object(bot_config, "REBALANCE_BLOCKED_REMINDER_HOURS", 1),
-            patch.object(bot_config, "MIN_SOL_BALANCE", 0.05),
+            patch.object(bot_config, "MIN_SOL_BALANCE", 0.08),
             patch.object(bot_config, "REBALANCE_PAYBACK_HOURS", 2.8),
             patch.object(bot_config, "UNECONOMIC_LOOKBACK_CYCLES", 5),
             patch.object(bot_config, "POLL_INTERVAL_SEC", 60),
@@ -72,6 +73,7 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
             p.stop()
         self.tmp.cleanup()
         main_mod.out_of_range_since = None
+        main_mod.last_auto_attempt_at = None
         main_mod._reset_rebalance_blocked_state()
 
     async def test_delay_prevents_immediate_rebalance(self) -> None:
@@ -125,7 +127,7 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
         st = ar_limits.AutoRebalanceState(day_utc="2026-07-29", count_today=1)
         ar_limits.record_rebalance(st, t0)  # sets last_rebalance_at=t0, count=2
         # Reset count for clarity — we care about interval
-        st = ar_limits.load_state()
+        st = ar_limits.load_state(now=t0)
         st.count_today = 1
         ar_limits.save_state(st)
 
@@ -134,7 +136,11 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
             with patch("main.money_ops.get_primary_position", return_value=_pos()):
                 with patch(
                     "main.meteora_ops.balances",
-                    return_value={"sol": {"ui": 1.0}, "usdc": {"ui": 10}},
+                    return_value={
+                        "sol": {"ui": 1.0},
+                        "usdc": {"ui": 10},
+                        "solAvailableForOpen": 0.9,
+                    },
                 ):
                     with patch("main.money_ops.rebalance_position") as reb:
                         await main_mod.monitor_position(now=t0 + timedelta(minutes=10))
@@ -153,7 +159,11 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
             with patch("main.money_ops.get_primary_position", return_value=_pos()):
                 with patch(
                     "main.meteora_ops.balances",
-                    return_value={"sol": {"ui": 1.0}, "usdc": {"ui": 10}},
+                    return_value={
+                        "sol": {"ui": 1.0},
+                        "usdc": {"ui": 10},
+                        "solAvailableForOpen": 0.9,
+                    },
                 ):
                     with patch("main.money_ops.rebalance_position") as reb:
                         with patch("main.send_telegram_message") as tg:
@@ -170,7 +180,11 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
             with patch("main.money_ops.get_primary_position", return_value=_pos()):
                 with patch(
                     "main.meteora_ops.balances",
-                    return_value={"sol": {"ui": 1.0}, "usdc": {"ui": 10}},
+                    return_value={
+                        "sol": {"ui": 1.0},
+                        "usdc": {"ui": 10},
+                        "solAvailableForOpen": 0.9,
+                    },
                 ):
                     with patch(
                         "main.cycle_journal.get_default_journal"

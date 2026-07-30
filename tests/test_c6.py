@@ -2,17 +2,22 @@
 """Offline tests for C6: total-USD budget, MAX_POSITION_USD, swap-fail abort."""
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
+os.environ["WALLET_KEYPAIR_PATH"] = str(
+    ROOT / "tests" / "fixtures" / "offline_keypair.json"
+)
 sys.path.insert(0, str(ROOT))
 
 import bot_config  # noqa: E402
-import money_ops  # noqa: E402
 
+bot_config.WALLET_KEYPAIR_PATH = os.environ["WALLET_KEYPAIR_PATH"]
+import money_ops  # noqa: E402
 
 def _suggest(total: float, *, sol_frac: float = 0.5, price: float = 100.0) -> dict:
     need_usdc = total * (1.0 - sol_frac)
