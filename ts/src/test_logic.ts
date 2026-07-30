@@ -14,7 +14,23 @@ import {
   type JournalEntry,
 } from "./journal";
 import { assertSendAllowed, parseNetwork } from "./network";
-import { rpcHostForLog, validateDepositAmounts } from "./build_lib";
+import {
+  pickSignersForPubkeys,
+  prepareTxForSend,
+  refreshVersionedBlockhash,
+  refuseMultiTxAddError,
+  rpcHostForLog,
+  shouldRefuseMultiTxAdd,
+  signatureFromVersioned,
+  validateDepositAmounts,
+} from "./build_lib";
+import {
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  TransactionMessage,
+  VersionedTransaction,
+} from "@solana/web3.js";
 
 let passed = 0;
 let failed = 0;
@@ -209,6 +225,105 @@ function testFailCarriesExtra(): void {
   assert(payload.stage === "send", "fail stage send");
 }
 
+function makeSignedTransfer(
+  payer: Keypair,
+  blockhash: string
+): VersionedTransaction {
+  const ix = SystemProgram.transfer({
+    fromPubkey: payer.publicKey,
+    toPubkey: Keypair.generate().publicKey,
+    lamports: 1,
+  });
+  const msg = new TransactionMessage({
+    payerKey: payer.publicKey,
+    recentBlockhash: blockhash,
+    instructions: [ix],
+  }).compileToV0Message();
+  const vtx = new VersionedTransaction(msg);
+  vtx.sign([payer]);
+  return vtx;
+}
+
+function fakeBlockhash(fill: number): string {
+  // recentBlockhash must decode to exactly 32 bytes
+  const bytes = new Uint8Array(32);
+  bytes.fill(fill & 0xff);
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const bs58 = require("bs58") as { encode: (b: Uint8Array) => string };
+  return bs58.encode(bytes);
+}
+
+async function testPrepareTxForSendFreshBlockhash(): Promise<void> {
+  const payer = Keypair.generate();
+  const bh1 = fakeBlockhash(1);
+  const bh2 = fakeBlockhash(2);
+  const vtx0 = makeSignedTransfer(payer, bh1);
+  const sig0 = signatureFromVersioned(vtx0);
+
+  // index 0 — no refresh
+  const first = await prepareTxForSend(vtx0, 0, [payer], async () => bh2);
+  assert(first.refreshed === false, "tx0 not refreshed");
+  assert(first.signature.length > 0, "tx0 signed");
+
+  // index 1 — refresh + resign → different signature
+  const second = await prepareTxForSend(vtx0, 1, [payer], async () => bh2);
+  assert(second.refreshed === true, "tx1 refreshed");
+  assert(second.signature !== sig0, "fresh blockhash changes signature");
+
+  // Missing second signer fails
+  const other = Keypair.generate();
+  let missing = false;
+  try {
+    pickSignersForPubkeys(
+      [payer.publicKey.toBase58(), other.publicKey.toBase58()],
+      [payer]
+    );
+  } catch {
+    missing = true;
+  }
+  assert(missing, "pickSigners requires all keys");
+
+  // refresh alone clears signatures
+  const refreshed = refreshVersionedBlockhash(vtx0, bh2);
+  let unsigned = false;
+  try {
+    signatureFromVersioned(refreshed);
+  } catch {
+    unsigned = true;
+  }
+  assert(unsigned, "refresh leaves tx unsigned until resign");
+}
+
+function testMultiTxAddGateOnTxCountNotWidth(): void {
+  // Wide range, single tx — allow without flag (C11b live case: width=69, txs=1)
+  assert(
+    shouldRefuseMultiTxAdd(1, false) === false,
+    "1 tx without flag must pass"
+  );
+  assert(
+    shouldRefuseMultiTxAdd(1, true) === false,
+    "1 tx with flag must pass"
+  );
+  // Real multi-tx without flag — refuse
+  assert(
+    shouldRefuseMultiTxAdd(2, false) === true,
+    "2 txs without flag must refuse"
+  );
+  assert(
+    shouldRefuseMultiTxAdd(3, false) === true,
+    "3 txs without flag must refuse"
+  );
+  // Real multi-tx with flag — allow
+  assert(
+    shouldRefuseMultiTxAdd(2, true) === false,
+    "2 txs with flag must pass"
+  );
+  const msg = refuseMultiTxAddError(3, 69);
+  assert(msg.includes("3 transactions"), "refuse names tx count");
+  assert(msg.includes("ALLOW_MULTI_TX_ADD"), "refuse tells what to enable");
+  assert(msg.includes("partially funded"), "refuse names partial-fill risk");
+}
+
 testJournalPendingToConfirmed();
 testJournalUnresolvedBlocks();
 testTransientClassifier();
@@ -217,10 +332,14 @@ testParseNetworkDefault();
 testNegativeAmounts();
 testRpcHostForLog();
 testFailCarriesExtra();
+testMultiTxAddGateOnTxCountNotWidth();
 
-Promise.all([testPollRetriesTransient(), testPollUnknownOnlyAfterWindow()]).then(
-  () => {
+Promise.all([
+  testPollRetriesTransient(),
+  testPollUnknownOnlyAfterWindow(),
+])
+  .then(() => testPrepareTxForSendFreshBlockhash())
+  .then(() => {
     console.log(`test_logic: passed=${passed} failed=${failed}`);
     process.exit(failed > 0 ? 1 : 0);
-  }
-);
+  });

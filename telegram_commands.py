@@ -687,14 +687,8 @@ async def addliquidity_command(
                 collector(
                     "⚠️ Позиция сейчас ВНЕ диапазона — доливка ляжет в основном в один токен."
                 )
-            half = range_state.current_half_width()
-            if half > 34:
-                collector(
-                    f"⚠️ Широкий диапазон (half={half}): долив может потребовать "
-                    "нескольких транзакций. Поздние части могут сорваться на "
-                    "просроченном blockhash — часть денег войдёт, часть нет. "
-                    "Узкий диапазон (/setrange) безопаснее."
-                )
+            # Multi-tx risk is gated in TS on actual tx count, not bin width
+            # (standard width=69 often builds as 1 tx). Scare only when refuse/notes say so.
             await _run_money(
                 money_ops.add_with_budget, position, usdc_amount, reply=collector
             )

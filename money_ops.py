@@ -644,7 +644,7 @@ def add_with_budget(
         position["pubkey"],
         need_sol,
         need_usdc,
-        allow_multi_tx=True,
+        allow_multi_tx=bool(bot_config.ALLOW_MULTI_TX_ADD),
         **exec_kwargs(),
     )
     assert_exec_fully_confirmed(payload)

@@ -21,6 +21,7 @@ import {
   fail,
   flagStr,
   parseArgs,
+  prepareTxForSend,
   requireFlag,
   rpcHostForLog,
 } from "./build_lib";
@@ -45,10 +46,6 @@ import {
 import { loadWalletKeypair } from "./wallet";
 
 type Json = Record<string, unknown>;
-
-// bs58 is a transitive dep of @solana/web3.js (signature encoding only).
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const bs58 = require("bs58") as { encode: (b: Uint8Array) => string };
 
 type TxMeta = {
   index: number;
@@ -81,33 +78,30 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function signatureFromV0(vtx: VersionedTransaction): string {
-  const sigBytes = vtx.signatures[0];
-  if (!sigBytes || sigBytes.every((b) => b === 0)) {
-    throw new Error("transaction not signed");
-  }
-  return bs58.encode(sigBytes);
+function partialFillExtra(
+  sends: Json[],
+  totalTxs: number
+): Record<string, unknown> {
+  const confirmed = sends.filter((s) => s.status === "confirmed").length;
+  return {
+    partialFill: confirmed > 0 && confirmed < totalTxs,
+    confirmedCount: confirmed,
+    totalTxs,
+  };
 }
 
-function pickSigners(
-  requiredPubkeys: string[],
-  wallet: Keypair,
-  positionKeypair?: Keypair
-): Keypair[] {
-  const map = new Map<string, Keypair>();
-  map.set(wallet.publicKey.toBase58(), wallet);
-  if (positionKeypair) {
-    map.set(positionKeypair.publicKey.toBase58(), positionKeypair);
-  }
-  const out: Keypair[] = [];
-  for (const pk of requiredPubkeys) {
-    const kp = map.get(pk);
-    if (!kp) {
-      throw new Error(`missing signer keypair for ${pk}`);
-    }
-    out.push(kp);
-  }
-  return out;
+function partialFillMessage(
+  index: number,
+  total: number,
+  confirmed: number,
+  detail: string
+): string {
+  if (confirmed <= 0) return detail;
+  return (
+    `PARTIAL FILL: ${confirmed}/${total} txs confirmed before failure at tx[${index}]. ` +
+    `${detail} Position may be only partly funded — check on-chain /status; ` +
+    "do not treat this as a full deposit. Close or top up consciously."
+  );
 }
 
 async function runBuild(
@@ -166,15 +160,56 @@ async function sendBuildResult(
   const params = (build.params as Record<string, unknown>) || {};
   const signatures: string[] = [];
   const sends: Json[] = [];
+  const available: Keypair[] = [wallet];
+  if (positionKeypair) available.push(positionKeypair);
 
   for (const txMeta of txs) {
-    const vtx = VersionedTransaction.deserialize(
+    let vtx = VersionedTransaction.deserialize(
       Buffer.from(txMeta.base64, "base64")
     );
-    const signerKps = pickSigners(txMeta.signers, wallet, positionKeypair);
-    vtx.sign(signerKps);
-    const signature = signatureFromV0(vtx);
 
+    let signature: string;
+    try {
+      const prepared = await prepareTxForSend(
+        vtx,
+        txMeta.index,
+        available,
+        async () => {
+          const { blockhash } = await connection.getLatestBlockhash("confirmed");
+          return blockhash;
+        }
+      );
+      vtx = prepared.vtx;
+      signature = prepared.signature;
+      if (prepared.refreshed) {
+        eprint(
+          `tx[${txMeta.index}] re-signed with fresh blockhash ` +
+            `(signers=${prepared.signers.join(",")})`
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const confirmed = sends.filter((s) => s.status === "confirmed").length;
+      fail(
+        action,
+        partialFillMessage(
+          txMeta.index,
+          txs.length,
+          confirmed,
+          `sign/prepare failed tx[${txMeta.index}]: ${msg}`
+        ),
+        "sign",
+        {
+          network,
+          signatures,
+          sends,
+          params,
+          ...partialFillExtra(sends, txs.length),
+        }
+      );
+    }
+
+    // Journal AFTER final sign so the recorded signature is the one on the wire.
     const pending: JournalEntry = {
       ts: new Date().toISOString(),
       action,
@@ -197,7 +232,6 @@ async function sendBuildResult(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // Client send error ≠ proof the cluster rejected the tx (skipPreflight).
-      // Leave unresolved so the journal still blocks the next send.
       updateJournalBySignature(journalPath, signature, {
         status: "unknown",
         error: `send exception (may still land): ${msg}`,
@@ -214,13 +248,25 @@ async function sendBuildResult(
         },
       ];
       const sigsSoFar = [...signatures, signature];
-      fail(action, `send failed tx[${txMeta.index}]: ${msg}`, "send", {
-        confirmationUnknown: true,
-        network,
-        signatures: sigsSoFar,
-        sends: sendsSoFar,
-        params,
-      });
+      const confirmed = sends.filter((s) => s.status === "confirmed").length;
+      fail(
+        action,
+        partialFillMessage(
+          txMeta.index,
+          txs.length,
+          confirmed,
+          `send failed tx[${txMeta.index}]: ${msg}`
+        ),
+        "send",
+        {
+          confirmationUnknown: true,
+          network,
+          signatures: sigsSoFar,
+          sends: sendsSoFar,
+          params,
+          ...partialFillExtra(sendsSoFar, txs.length),
+        }
+      );
     }
 
     if (opts?.crashAfterSend) {
@@ -255,28 +301,39 @@ async function sendBuildResult(
     });
 
     if (status === "failed") {
+      const confirmed = sends.filter((s) => s.status === "confirmed").length;
       fail(
         action,
-        `tx[${txMeta.index}] failed on-chain: ${error}`,
+        partialFillMessage(
+          txMeta.index,
+          txs.length,
+          confirmed,
+          `tx[${txMeta.index}] failed on-chain: ${error}`
+        ),
         "confirm",
         {
           network,
           signatures,
           sends,
           params,
+          ...partialFillExtra(sends, txs.length),
         }
       );
     }
     if (status === "unknown") {
-      // Unknown ≠ success. Stop the batch; leave journal as unknown; do not
-      // retry send. Caller (Python) must treat ok:false and keep reopen_pending.
       eprint(
         `tx[${txMeta.index}] confirmation unknown — failing this exec; ` +
           "journal left as unknown; do not retry blindly"
       );
+      const confirmed = sends.filter((s) => s.status === "confirmed").length;
       fail(
         action,
-        `tx[${txMeta.index}] confirmation unknown — do not retry blindly`,
+        partialFillMessage(
+          txMeta.index,
+          txs.length,
+          confirmed,
+          `tx[${txMeta.index}] confirmation unknown — do not retry blindly`
+        ),
         "confirm-unknown",
         {
           confirmationUnknown: true,
@@ -284,6 +341,7 @@ async function sendBuildResult(
           signatures,
           sends,
           params,
+          ...partialFillExtra(sends, txs.length),
         }
       );
     }

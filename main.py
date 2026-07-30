@@ -596,7 +596,7 @@ async def main() -> None:
     state_warn = (
         ""
         if persistent
-        else "\n⚠️ state/ без маркера — смонтируй том /app/state"
+        else "\n⚠️ Без нормального тома на /app/state состояние пропадёт при recreate"
     )
     send_telegram_message(
         f"🤖 <b>Meteora LP-бот запущен</b>\n"

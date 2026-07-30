@@ -67,6 +67,10 @@ REBALANCE_BLOCKED_REMINDER_HOURS = float(
 
 MIN_SOL_BALANCE = float(os.getenv("MIN_SOL_BALANCE", "0.08"))
 
+# Opt-in when build-add returns >1 tx (C11b). Default off — one-tx adds work
+# without this flag. Late chunks re-sign with a fresh blockhash (C11).
+ALLOW_MULTI_TX_ADD = _env_bool("ALLOW_MULTI_TX_ADD", "false")
+
 # Cap on position size in USD (open / add / rebalance reopen). Empty = unlimited
 # (wallet≈position model, same as Orca). Set e.g. 50 for safe rehearsals.
 # Required when AUTO_REBALANCE is on AND network is mainnet (see main.py).

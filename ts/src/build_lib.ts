@@ -6,6 +6,7 @@ import {
   Connection,
   ComputeBudgetProgram,
   Keypair,
+  MessageV0,
   PublicKey,
   Transaction,
   TransactionMessage,
@@ -376,6 +377,113 @@ function v0Signers(vtx: VersionedTransaction): string[] {
   const out: string[] = [];
   for (let i = 0; i < n; i++) out.push(keys[i].toBase58());
   return out;
+}
+
+/** Rebuild a v0 tx with a new recentBlockhash (unsigned). */
+export function refreshVersionedBlockhash(
+  vtx: VersionedTransaction,
+  recentBlockhash: string
+): VersionedTransaction {
+  const old = vtx.message;
+  const lookups =
+    "addressTableLookups" in old ? old.addressTableLookups : [];
+  const msg = new MessageV0({
+    header: old.header,
+    staticAccountKeys: [...old.staticAccountKeys],
+    recentBlockhash,
+    compiledInstructions: old.compiledInstructions.map((ci) => ({
+      programIdIndex: ci.programIdIndex,
+      accountKeyIndexes: [...ci.accountKeyIndexes],
+      data: ci.data,
+    })),
+    addressTableLookups: lookups.map((l) => ({
+      accountKey: l.accountKey,
+      writableIndexes: [...l.writableIndexes],
+      readonlyIndexes: [...l.readonlyIndexes],
+    })),
+  });
+  return new VersionedTransaction(msg);
+}
+
+export function signatureFromVersioned(vtx: VersionedTransaction): string {
+  // bs58 is a transitive dep of @solana/web3.js
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const bs58 = require("bs58") as { encode: (b: Uint8Array) => string };
+  const sigBytes = vtx.signatures[0];
+  if (!sigBytes || sigBytes.every((b) => b === 0)) {
+    throw new Error("transaction not signed");
+  }
+  return bs58.encode(sigBytes);
+}
+
+export function pickSignersForPubkeys(
+  requiredPubkeys: string[],
+  available: Keypair[]
+): Keypair[] {
+  const map = new Map<string, Keypair>();
+  for (const kp of available) {
+    map.set(kp.publicKey.toBase58(), kp);
+  }
+  const out: Keypair[] = [];
+  for (const pk of requiredPubkeys) {
+    const kp = map.get(pk);
+    if (!kp) {
+      throw new Error(`missing signer keypair for ${pk}`);
+    }
+    out.push(kp);
+  }
+  return out;
+}
+
+/** Refuse multi-tx add only when build actually produced >1 transaction. */
+export function shouldRefuseMultiTxAdd(
+  txCount: number,
+  allowMultiTx: boolean
+): boolean {
+  return txCount > 1 && !allowMultiTx;
+}
+
+/** Human-readable refuse text when add would send more than one tx without opt-in. */
+export function refuseMultiTxAddError(txCount: number, width: number): string {
+  return (
+    `refusing add: build produced ${txCount} transactions (width=${width}) ` +
+    `without --allow-multi-tx. If only a prefix lands, later chunks never run — ` +
+    `position stays partially funded. Set ALLOW_MULTI_TX_ADD=true (or pass ` +
+    `--allow-multi-tx) only if you accept that risk and will check /status after.`
+  );
+}
+
+/**
+ * For multi-tx batches: refresh blockhash on every part after the first,
+ * then sign with all required keys. Journal must use the returned signature.
+ */
+export async function prepareTxForSend(
+  vtx: VersionedTransaction,
+  txIndex: number,
+  availableSigners: Keypair[],
+  getBlockhash: () => Promise<string>
+): Promise<{
+  vtx: VersionedTransaction;
+  signature: string;
+  refreshed: boolean;
+  signers: string[];
+}> {
+  let out = vtx;
+  let refreshed = false;
+  if (txIndex > 0) {
+    const blockhash = await getBlockhash();
+    out = refreshVersionedBlockhash(out, blockhash);
+    refreshed = true;
+  }
+  const required = v0Signers(out);
+  const kps = pickSignersForPubkeys(required, availableSigners);
+  out.sign(kps);
+  return {
+    vtx: out,
+    signature: signatureFromVersioned(out),
+    refreshed,
+    signers: required,
+  };
 }
 
 function v0AccountsCount(vtx: VersionedTransaction): number {
@@ -994,17 +1102,14 @@ export async function cmdBuildAdd(
       `chunk[${i}] bins [${c.lowerBinId}, ${c.upperBinId}] width=${c.upperBinId - c.lowerBinId + 1}`
   );
 
-  // Wide ranges use the chunkable path (even when SDK currently returns 1 tx).
-  // Require an explicit opt-in: partial landing of a multi-tx series is dangerous.
-  if ((txs.length > 1 || width > maxBinsOneTx) && !allowMultiTx) {
+  // Gate on actual tx count, not bin width: chunkable path can still return 1 tx
+  // (e.g. width=69 on our pool). Partial-fill risk exists only when txs > 1.
+  if (shouldRefuseMultiTxAdd(txs.length, allowMultiTx)) {
     return {
       ok: false,
       action,
       stage: "multi-tx",
-      error:
-        `refusing add for width=${width} (txs=${txs.length}) without --allow-multi-tx; ` +
-        `width > MAX_BIN_LENGTH_ALLOWED_IN_ONE_TX (${maxBinsOneTx}) uses chunkable path ` +
-        `(partial landing leaves an intermediate position)`,
+      error: refuseMultiTxAddError(txs.length, width),
       owner: owner.toBase58(),
       pool: pool.toBase58(),
       params: {
@@ -1026,7 +1131,7 @@ export async function cmdBuildAdd(
         `SDK method: ${method}`,
         `position range [${lowerBinId}, ${upperBinId}] width=${width}`,
         ...chunkNotes,
-        "Pass --allow-multi-tx only if you accept that landing a prefix of chunks leaves partial liquidity.",
+        "Pass --allow-multi-tx / ALLOW_MULTI_TX_ADD=true only if you accept partial fill.",
       ],
     };
   }
@@ -1037,13 +1142,12 @@ export async function cmdBuildAdd(
     `chunkable threshold: width > MAX_BIN_LENGTH_ALLOWED_IN_ONE_TX (${maxBinsOneTx})`,
     `amounts SOL=${solUi} USDC=${usdcUi} (solIsX=${order.solIsX}); slippageBps=${slippageBps} (SDK percent=${slippagePct}, DEFAULT_SLIPPAGE_BPS=${DEFAULT_SLIPPAGE_BPS})`,
     "Required signer: owner only (existing position account).",
-    allowMultiTx && width > maxBinsOneTx
+    allowMultiTx && txs.length > 1
       ? `allow-multi-tx enabled: txs=${txs.length}. If only a prefix of a multi-tx series lands, later chunks never run — position stays partially filled. Expected chunk coverage (chunkBinRange): ${chunkNotes.join("; ")}`
       : txs.length > 1
         ? `multiple txs=${txs.length}; simulated independently. Chunk coverage: ${chunkNotes.join("; ")}`
         : "single transaction",
   ];
-
   return finalizeBuild(
     connection,
     action,

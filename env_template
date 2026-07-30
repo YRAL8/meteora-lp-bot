@@ -54,6 +54,12 @@ MIN_SOL_BALANCE=0.08
 # REQUIRED when AUTO_REBALANCE=true on mainnet.
 # MAX_POSITION_USD=50
 
+# Allow /addliquidity only when build returns >1 tx (default off). One-tx adds
+# (including standard width=69 on our pool) do not need this. Late chunks are
+# re-signed with a fresh blockhash (C11); opt-in because a mid-batch failure
+# leaves a partial position.
+ALLOW_MULTI_TX_ADD=false
+
 # Priority fee in microlamports per compute unit (TS + Python). Default 50000 ≈
 # Helius "medium" / reliable inclusion without overpaying. Override if congested.
 PRIORITY_FEE_MICROLAMPORTS=50000
