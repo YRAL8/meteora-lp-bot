@@ -22,6 +22,7 @@ import {
   flagStr,
   parseArgs,
   requireFlag,
+  rpcHostForLog,
 } from "./build_lib";
 import {
   appendJournalEntry,
@@ -291,7 +292,7 @@ async function main(): Promise<void> {
     const journalPath = defaultJournalPath();
     const pollMs = Number(flagStr(flags, "poll-ms") || "1500");
     const timeoutMs = Number(flagStr(flags, "timeout-ms") || "60000");
-    eprint(`resolve-journal rpc=${rpc} journal=${journalPath}`);
+    eprint(`resolve-journal rpc=${rpcHostForLog(rpc)} journal=${journalPath}`);
     const before = unresolvedEntries(readJournal(journalPath));
     for (const e of before) {
       const { outcome, slot, error } = await pollSignatureStatus(
@@ -365,7 +366,7 @@ async function main(): Promise<void> {
     flagStr(flags, "wallet")
   );
   eprint(
-    `cmd=${cmd} network=${network} rpc=${rpc} pool=${poolStr} wallet=${pubkey} ` +
+    `cmd=${cmd} network=${network} rpc=${rpcHostForLog(rpc)} pool=${poolStr} wallet=${pubkey} ` +
       `mode=${dryRun ? "dry-run" : "send"} journal=${journalPath}`
   );
 

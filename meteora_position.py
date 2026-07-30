@@ -29,6 +29,17 @@ def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
+def rpc_host_for_log(rpc_url: str) -> str:
+    """Host only — RPC URLs often carry api-key= in the query."""
+    from urllib.parse import urlparse
+
+    try:
+        host = urlparse(rpc_url).hostname
+        return host or "(rpc)"
+    except Exception:
+        return "(rpc)"
+
+
 def sleep_with_jitter(seconds: float) -> None:
     jitter = (time.time_ns() % 10_000_000) / 10_000_000 * 0.05
     time.sleep(max(0.0, seconds + jitter))
@@ -612,7 +623,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             sleep_s=sleep_s,
             limit=int(args.limit),
         )
-        print(f"RPC: {rpc_url}")
+        print(f"RPC: {rpc_host_for_log(rpc_url)}")
         print(f"LbPair: {lb_pair}")
         print(f"Found PositionV2 accounts (showing up to {len(pubs)}):")
         for pk in pubs:
@@ -783,7 +794,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif x_is_usdc and y_is_sol and px_usd > 0 and py_usd > 0:
             api_ratio_usdc_per_sol = Decimal(str(py_usd / px_usd))
 
-        print(f"RPC: {rpc_url}")
+        print(f"RPC: {rpc_host_for_log(rpc_url)}")
         print(f"Position: {pos_pk}")
         print(f"LbPair: {lb_pair}")
         print("")

@@ -63,6 +63,24 @@ export function eprint(...args: unknown[]): void {
   console.error(...args);
 }
 
+/** Host only — never log query/path (RPC URLs often carry api-key=). */
+export function rpcHostForLog(rpc: string): string {
+  if (!rpc || typeof rpc !== "string") return "(rpc)";
+  try {
+    const u = new URL(rpc);
+    return u.host || "(rpc)";
+  } catch {
+    // Non-URL strings: strip anything after ? to avoid leaking keys.
+    const noQuery = rpc.split("?", 1)[0] ?? rpc;
+    try {
+      const u = new URL(noQuery.includes("://") ? noQuery : `https://${noQuery}`);
+      return u.host || "(rpc)";
+    } catch {
+      return "(rpc)";
+    }
+  }
+}
+
 export function fail(action: string, error: string, stage: string): never {
   process.stdout.write(
     JSON.stringify({ ok: false, action, error, stage }) + "\n"

@@ -11,11 +11,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+os.environ.setdefault(
+    "WALLET_KEYPAIR_PATH",
+    os.path.expanduser("~/.config/solana/meteora-devnet.json"),
+)
+
 import bot_config  # noqa: E402
 import meteora_ops  # noqa: E402
 import telegram_commands as tg  # noqa: E402
 from position_state import load_last_position  # noqa: E402
 from tests.test_telegram_commands import _update_with_args  # noqa: E402
+from tests.live_guard import begin_live_script  # noqa: E402
+
+begin_live_script()
 
 
 async def _run(name: str, args: list[str]) -> dict:
@@ -33,10 +41,6 @@ async def _run(name: str, args: list[str]) -> dict:
 
 
 async def main() -> None:
-    os.environ.setdefault("WALLET_KEYPAIR_PATH", str(Path.home() / ".config/solana/meteora-devnet.json"))
-    print(f"network={bot_config.effective_network()} pool={bot_config.pool_pubkey()}")
-    print(f"owner={bot_config.wallet_pubkey()}")
-
     results = []
 
     # Optional: swap USDC if needed — skip if enough USDC

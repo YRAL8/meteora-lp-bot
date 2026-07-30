@@ -14,7 +14,7 @@ import {
   type JournalEntry,
 } from "./journal";
 import { assertSendAllowed, parseNetwork } from "./network";
-import { validateDepositAmounts } from "./build_lib";
+import { rpcHostForLog, validateDepositAmounts } from "./build_lib";
 
 let passed = 0;
 let failed = 0;
@@ -176,12 +176,29 @@ function testNegativeAmounts(): void {
   }
 }
 
+function testRpcHostForLog(): void {
+  assert(
+    rpcHostForLog("https://devnet.helius-rpc.com/?api-key=SECRET") ===
+      "devnet.helius-rpc.com",
+    "strips api-key query"
+  );
+  assert(
+    rpcHostForLog("https://api.devnet.solana.com") === "api.devnet.solana.com",
+    "public rpc host"
+  );
+  assert(
+    !rpcHostForLog("https://x.example/?api-key=SECRET").includes("SECRET"),
+    "secret never in host"
+  );
+}
+
 testJournalPendingToConfirmed();
 testJournalUnresolvedBlocks();
 testTransientClassifier();
 testMainnetGuard();
 testParseNetworkDefault();
 testNegativeAmounts();
+testRpcHostForLog();
 
 Promise.all([testPollRetriesTransient(), testPollUnknownOnlyAfterWindow()]).then(
   () => {

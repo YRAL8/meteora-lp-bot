@@ -29,6 +29,9 @@ import range_state  # noqa: E402
 import telegram_commands as tg  # noqa: E402
 from reopen_pending import is_reopen_pending, set_reopen_pending  # noqa: E402
 from tests.test_telegram_commands import _update_with_args  # noqa: E402
+from tests.live_guard import begin_live_script  # noqa: E402
+
+begin_live_script()
 
 
 async def call(name: str, args: list[str] | None = None) -> list[str]:

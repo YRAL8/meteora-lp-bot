@@ -22,6 +22,7 @@ import {
   flagStr,
   parseArgs,
   requireFlag,
+  rpcHostForLog,
 } from "./build_lib";
 
 type Json = Record<string, unknown>;
@@ -33,7 +34,7 @@ async function main(): Promise<void> {
   const connection = new Connection(rpc, "confirmed");
   const pool = new PublicKey(poolStr);
 
-  eprint(`cmd=${cmd} rpc=${rpc} pool=${poolStr}`);
+  eprint(`cmd=${cmd} rpc=${rpcHostForLog(rpc)} pool=${poolStr}`);
 
   try {
     let out: Json;

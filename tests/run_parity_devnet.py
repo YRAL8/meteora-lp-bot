@@ -11,12 +11,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+os.environ.setdefault(
+    "WALLET_KEYPAIR_PATH",
+    os.path.expanduser("~/.config/solana/meteora-devnet.json"),
+)
+
 import bot_config  # noqa: E402
 import money_ops  # noqa: E402
 import range_state  # noqa: E402
 import telegram_commands as tg  # noqa: E402
 from reopen_pending import is_reopen_pending, load_reopen_pending, set_reopen_pending  # noqa: E402
 from tests.test_telegram_commands import _update_with_args  # noqa: E402
+from tests.live_guard import begin_live_script  # noqa: E402
+
+begin_live_script()
 
 
 async def _run(name: str, args: list[str]) -> dict:
@@ -37,8 +45,6 @@ def _print(r: dict) -> None:
 
 async def main() -> None:
     results = []
-    print(f"network={bot_config.effective_network()} pool={bot_config.pool_pubkey()}")
-    print(f"owner={bot_config.wallet_pubkey()}")
 
     # Clear leftover reopen flag from prior crash tests
     set_reopen_pending(False)
