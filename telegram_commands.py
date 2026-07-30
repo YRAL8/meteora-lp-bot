@@ -139,8 +139,8 @@ async def _handle_journal_block(update: Update, err: BaseException) -> bool:
         f"Снято: {cleared}.",
         "Проверь в обозревателе, затем:",
         "• /status journal — опросить ещё раз",
-        "• /status journal-forget confirm — снять блок "
-        "(только если на explorer уже видно итог; повторной отправки не будет)",
+        "• /status journal-forget &lt;подпись&gt; confirm — снять ОДНУ "
+        "запись после опроса сети",
         "",
     ]
     for u in still[:5]:
@@ -249,20 +249,73 @@ async def _journal_status_command(
     args = [a.lower() for a in (context.args or [])]
     forget = bool(args) and args[0] == "journal-forget"
     if forget:
-        if len(args) < 2 or args[1] != "confirm":
+        # /status journal-forget <signature> confirm
+        if len(args) < 3 or args[-1] != "confirm":
             await _reply(
                 update,
-                "Снять блок журнала: /status journal-forget confirm\n"
-                "Только после проверки подписей в explorer. "
-                "Повторной отправки транзакций не будет.",
+                "Снять одну запись журнала:\n"
+                "/status journal-forget &lt;подпись&gt; confirm\n"
+                "Бот сам опросит сеть. Массового снятия больше нет. "
+                "Аварийный выход: /status journal или /withdraw confirm.",
+                parse_mode="HTML",
             )
             return
-        result = await _run_money(meteora_exec.forget_unresolved_journal)
-        await _reply(
-            update,
-            f"🔓 Журнал: снято блокирующих записей: {result.get('cleared', 0)}. "
-            "Денежные команды снова можно пробовать.",
+        signature = context.args[1].strip() if context.args and len(context.args) > 1 else ""
+        if not signature or signature.lower() == "confirm":
+            await _reply(
+                update,
+                "❌ Нужна подпись: /status journal-forget &lt;подпись&gt; confirm",
+                parse_mode="HTML",
+            )
+            return
+        net = money_ops.exec_kwargs().get("network", "devnet")
+        rpc = money_ops.exec_kwargs().get("rpc")
+        result = await _run_money(
+            meteora_exec.forget_unresolved_journal,
+            signature=signature,
+            rpc=rpc,
+            network=net,
         )
+        if not result.get("ok"):
+            refuse = result.get("refuse")
+            if refuse == "confirmed":
+                import html as _html
+
+                cluster = bot_config.explorer_cluster()
+                q = "?cluster=devnet" if cluster == "devnet" else ""
+                exp = f"https://explorer.solana.com/tx/{signature}{q}"
+                href = _html.escape(exp, quote=True)
+                await _reply(
+                    update,
+                    "❌ Подпись <b>подтверждена</b> в сети — забывать нельзя.\n"
+                    "Разреши через /status journal или смотри "
+                    f'<a href="{href}">{escape_html(signature)}</a>.',
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                return
+            await _reply(
+                update,
+                f"❌ Не снял: {escape_html(result.get('error') or result)}",
+                parse_mode="HTML",
+            )
+            return
+        outcome = result.get("outcome")
+        if outcome == "not_found_expired":
+            await _reply(
+                update,
+                f"🔓 Считал подпись <code>{escape_html(signature)}</code> "
+                f"непрошедшей (не найдена после окна подтверждения). "
+                f"Снято: {result.get('cleared', 0)}.",
+                parse_mode="HTML",
+            )
+        else:
+            await _reply(
+                update,
+                f"🔓 Журнал: снято записей: {result.get('cleared', 0)} "
+                f"(outcome={escape_html(outcome)}).",
+                parse_mode="HTML",
+            )
         return
 
     await _reply(update, "🔎 Опрашиваю неподтверждённые подписи в журнале…")
@@ -287,8 +340,8 @@ async def _journal_status_command(
         return
     lines = [
         f"⚠️ Неразрешённых записей: {len(still)} (снято сейчас: {cleared}).",
-        "Повтори /status journal позже или, убедившись в explorer:",
-        "/status journal-forget confirm",
+        "Повтори /status journal позже или сними ОДНУ подпись:",
+        "/status journal-forget &lt;подпись&gt; confirm",
         "",
     ]
     for u in still[:8]:
@@ -777,6 +830,16 @@ async def rebalance_command(
         if position is None:
             await _reply(update, "❌ Нет открытой позиции для ребаланса.")
             return
+        if (
+            bot_config.effective_network() == "mainnet"
+            and bot_config.MAX_POSITION_USD is None
+        ):
+            await _reply(
+                update,
+                "❌ На mainnet без MAX_POSITION_USD ручной /rebalance "
+                "запрещён (иначе откроет ≈ весь кошелёк). Задай потолок в .env.",
+            )
+            return
         pool = await _run_money(meteora_ops.pool_info, **money_ops.ops_kwargs())
         price = float(pool.get("usdcPerSol") or 0)
         val = money_ops.position_value_usd(position, price)
@@ -794,6 +857,17 @@ async def rebalance_command(
             f"(≈0.02% от позиции).\n\n"
             f"Подтвердить: /rebalance confirm",
             parse_mode="HTML",
+        )
+        return
+
+    if (
+        bot_config.effective_network() == "mainnet"
+        and bot_config.MAX_POSITION_USD is None
+    ):
+        await _reply(
+            update,
+            "❌ На mainnet без MAX_POSITION_USD ручной /rebalance "
+            "запрещён (иначе откроет ≈ весь кошелёк). Задай потолок в .env.",
         )
         return
 
@@ -826,6 +900,13 @@ async def rebalance_command(
         except SwapFailedOpenAborted as e:
             await flush()
             await _reply(update, f"❌ Ребаланс: реоткрытие отменено: {e}")
+        except money_ops.StopRequested:
+            await flush()
+            await _reply(
+                update,
+                "🛑 Ребаланс остановлен по /stop — новые tx не отправлял. "
+                "Если close уже прошёл, капитал на кошельке; см. reopen_pending.",
+            )
         except MeteoraExecError as e:
             await flush()
             if await _handle_journal_block(update, e):
@@ -853,7 +934,9 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     bot_state.bot_frozen = True
     await _reply(
         update,
-        "🛑 Полная заморозка — автоматика и /rebalance, /addliquidity, /open отключены.\n"
+        "🛑 Полная заморозка — автоматика и /rebalance, /addliquidity, /open "
+        "отключены.\n"
+        "Новые транзакции не отправляются; уже отправленная доходит до конца.\n"
         "/withdraw confirm по-прежнему работает (аварийный выход).\n"
         "Вернуть всё: /boevoy",
     )

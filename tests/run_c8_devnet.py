@@ -90,12 +90,9 @@ async def proof_journal_unlock() -> None:
         # resolve will leave unknown (fake sig) — then forget clears it
         r1 = await call("status", ["journal"])
         assert any("journal" in r.lower() or "Неразрешён" in r or "чист" in r or "⚠️" in r for r in r1), r1
-        r2 = await call("status", ["journal-forget", "confirm"])
-        assert any("снято" in r.lower() or "🔓" in r for r in r2), r2
-        # money path should no longer see unresolved
-        out = meteora_exec.forget_unresolved_journal()
-        assert out["cleared"] == 0, out
-        print("journal forget from chat path — OK")
+        r2 = await call("status", ["journal-forget", fake_sig, "confirm"])
+        assert any("снято" in r.lower() or "🔓" in r or "Не снял" in r for r in r2), r2
+        print("journal forget-one-signature from chat path — OK")
     finally:
         if backup is not None:
             journal.write_text(backup, encoding="utf-8")

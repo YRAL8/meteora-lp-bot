@@ -29,6 +29,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 out_of_range_since: Optional[datetime] = None
+last_auto_attempt_at: Optional[datetime] = None
 rebalance_blocked_alert_sent = False
 rebalance_blocked_last_alert_at: Optional[datetime] = None
 
@@ -111,7 +112,7 @@ def _tg_reply_collector(buf: list[str]):
 
 async def monitor_position(*, now: datetime | None = None) -> None:
     """One monitoring tick. `now` is injectable for offline tests."""
-    global out_of_range_since
+    global out_of_range_since, last_auto_attempt_at
 
     if bot_state.bot_paused or bot_state.bot_frozen:
         log.info("Бот на паузе/заморожен — пропускаю тик мониторинга")
@@ -190,6 +191,7 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                     f"{range_line}"
                 )
             out_of_range_since = None
+            last_auto_attempt_at = None
             _reset_rebalance_blocked_state()
             return
 
@@ -255,7 +257,7 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                     "🛑 <b>AUTO_REBALANCE на mainnet без MAX_POSITION_USD</b>\n"
                     "Автоматика отключена, пока не задашь потолок в .env "
                     "(иначе ребаланс втянет почти весь кошелёк).\n"
-                    "Ручной /rebalance по-прежнему доступен."
+                    "Ручной /rebalance на mainnet без потолка тоже запрещён."
                 )
                 _mark_blocked_reminder_sent(now)
             log.error("AUTO_REBALANCE+mainnet without MAX_POSITION_USD — skip")
@@ -267,10 +269,11 @@ async def monitor_position(*, now: datetime | None = None) -> None:
         price2 = float(pool2.get("usdcPerSol") or 0)
         still_out = not position_in_range(pos, active2)
         if not still_out:
-            out_of_range_since = None
-            _reset_rebalance_blocked_state()
             lo2, hi2 = _price_bounds(pos, active2, price2, int(pool2["binStep"]))
             log.info("Цена вернулась после выдержки — ребаланс отменён")
+            out_of_range_since = None
+            last_auto_attempt_at = None
+            _reset_rebalance_blocked_state()
             send_telegram_message(
                 f"✅ <b>Цена вернулась — авто-ребаланс отменён</b>\n"
                 f"📈 Цена SOL: ${price2:.4f}\n"
@@ -309,27 +312,56 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                 log.warning("MAX_REBALANCES_PER_DAY reached — auto paused for today")
             return
 
-        # Low SOL blocks action only — keep out_of_range_since
+        # Low SOL: same number open uses (rent + fee reserve already subtracted)
         bal = meteora_ops.balances(owner, **kw)
         sol_ui = float((bal.get("sol") or {}).get("ui") or 0)
-        if sol_ui < bot_config.MIN_SOL_BALANCE:
+        sao = bal.get("solAvailableForOpen")
+        if sao is not None:
+            usable_sol = max(0.0, float(sao))
+        else:
+            usable_sol = max(0.0, sol_ui - bot_config.MIN_SOL_BALANCE)
+        if usable_sol <= 0:
             if _should_send_blocked_reminder(now):
                 send_telegram_message(
-                    f"⚠️ <b>Авто-ребаланс отложен — мало SOL</b>\n"
-                    f"Баланс {sol_ui:.4f} &lt; MIN_SOL_BALANCE="
-                    f"{bot_config.MIN_SOL_BALANCE}.\n"
+                    f"⚠️ <b>Авто-ребаланс отложен — мало SOL для открытия</b>\n"
+                    f"solAvailableForOpen={usable_sol:.4f} "
+                    f"(баланс {sol_ui:.4f}, MIN_SOL_BALANCE="
+                    f"{bot_config.MIN_SOL_BALANCE}).\n"
                     f"Вне диапазона уже {minutes_out:.0f} мин. "
                     f"Таймер не сброшен — повторю на следующем тике."
                 )
                 _mark_blocked_reminder_sent(now)
-            log.warning("Низкий SOL %.4f — ребаланс отложен", sol_ui)
+            log.warning(
+                "Мало SOL для открытия usable=%.4f sol=%.4f — ребаланс отложен",
+                usable_sol,
+                sol_ui,
+            )
             return
+
+        # After a failed attempt, wait at least REBALANCE_DELAY_MIN before retry
+        # without clearing out_of_range_since (C9).
+        if last_auto_attempt_at is not None:
+            since_attempt = (now - last_auto_attempt_at).total_seconds() / 60.0
+            if since_attempt < bot_config.REBALANCE_DELAY_MIN:
+                log.info(
+                    "Пауза после неуспешной попытки: %.1f < %s мин",
+                    since_attempt,
+                    bot_config.REBALANCE_DELAY_MIN,
+                )
+                if _should_send_blocked_reminder(now):
+                    send_telegram_message(
+                        f"⏳ Авто-ребаланс ждёт паузу после неудачи "
+                        f"({since_attempt:.0f}/{bot_config.REBALANCE_DELAY_MIN} мин). "
+                        f"Таймер вне диапазона сохранён."
+                    )
+                    _mark_blocked_reminder_sent(now)
+                return
 
         # Uneconomic diagnosis — warn only
         _maybe_warn_uneconomic(pos, price2)
 
-        # Act
-        out_of_range_since = None
+        # Act — do NOT clear out_of_range_since until success
+        last_auto_attempt_at = now
         lo_now, hi_now = _price_bounds(pos, active2, price2, int(pool2["binStep"]))
         start_msg = (
             f"🤖 <b>Авто-ребаланс</b>\n"
@@ -366,6 +398,13 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                 )
                 from reopen_pending import is_reopen_pending as _pending_now
 
+                if bot_state.bot_frozen:
+                    send_telegram_message(
+                        "🛑 Авто-ребаланс прерван заморозкой (/stop) — "
+                        "успехом не считаю, суточный лимит не засчитан."
+                    )
+                    log.warning("Авто-ребаланс finished under freeze — not success")
+                    return
                 if payload is None or _pending_now():
                     meta = load_reopen_pending() or {}
                     send_telegram_message(
@@ -382,6 +421,8 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                         _pending_now(),
                     )
                     return
+                out_of_range_since = None
+                last_auto_attempt_at = None
                 ar_limits.record_rebalance(lim, now)
                 _reset_rebalance_blocked_state()
                 send_telegram_message("✅ Авто-ребаланс завершён.")
@@ -434,7 +475,8 @@ async def main() -> None:
         send_telegram_message(
             "🛑 <b>AUTO_REBALANCE на mainnet без MAX_POSITION_USD</b>\n"
             "Автоматика не будет тратить деньги, пока не задашь потолок. "
-            "Ручные команды работают."
+            "Ручной /rebalance на mainnet без потолка тоже запрещён; "
+            "/open с явной суммой — можно."
         )
 
     async def _monitor_loop() -> None:

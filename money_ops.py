@@ -6,6 +6,7 @@ import os
 from typing import Any, Callable
 
 import bot_config
+import bot_state
 import meteora_cycle_journal as cycle_journal
 import meteora_exec
 import meteora_ops
@@ -29,6 +30,75 @@ _MIN_OPEN_USD = 0.05
 
 class SwapFailedOpenAborted(RuntimeError):
     """Swap failed and a proportion-correct open was not possible — do not open crooked."""
+
+
+class StopRequested(RuntimeError):
+    """Owner froze the bot (/stop); do not start the next money transaction."""
+
+
+def require_not_frozen(*, reply: Callable[[str], Any], where: str) -> None:
+    """Cooperative cancel: already-sent txs finish; do not begin the next one."""
+    if bot_state.bot_frozen:
+        reply(
+            f"🛑 Остановлено по /stop ({where}). "
+            "Уже отправленная транзакция дойдёт до конца; новые не отправляю."
+        )
+        raise StopRequested(where)
+
+
+def require_max_position_on_mainnet(*, reply: Callable[[str], Any]) -> None:
+    """Wallet-sized opens on mainnet need an explicit ceiling (audit C9)."""
+    if bot_config.effective_network() != "mainnet":
+        return
+    if bot_config.MAX_POSITION_USD is not None:
+        return
+    reply(
+        "❌ На mainnet без MAX_POSITION_USD нельзя открывать позицию «на весь "
+        "кошелёк». Задай потолок в .env (например MAX_POSITION_USD=10) и "
+        "перезапусти бота."
+    )
+    raise RuntimeError("mainnet requires MAX_POSITION_USD for wallet-sized open")
+
+
+def _signatures_from_exec_error(err: MeteoraExecError) -> list[str]:
+    """Collect any on-wire signatures from an exec error payload."""
+    payload = err.payload or {}
+    sigs = payload.get("signatures") or []
+    if sigs:
+        return [str(s) for s in sigs]
+    out: list[str] = []
+    for s in payload.get("sends") or []:
+        if s.get("signature"):
+            out.append(str(s["signature"]))
+    return out
+
+
+def _close_proven_not_sent(err: MeteoraExecError) -> bool:
+    """True only when the response proves no tx was submitted (no signatures)."""
+    return not _signatures_from_exec_error(err)
+
+
+def _reply_close_outcome_unknown(
+    reply: Callable[[str], Any],
+    *,
+    signatures: list[str] | None = None,
+    detail: str | None = None,
+) -> None:
+    sigs = signatures or []
+    sig_line = ", ".join(sigs[:3]) if sigs else "(подписи в ответе нет — смотри /status journal)"
+    lines = [
+        "⚠️ Исход закрытия НЕЯСЕН.",
+        "Позиции может уже не быть — деньги могут лежать на кошельке.",
+        f"Подпись: <code>{escape_html(sig_line)}</code>",
+    ]
+    if detail:
+        lines.append(f"Деталь: <code>{escape_html(detail)}</code>")
+    lines.append(
+        "Автоматика стоит, пока не выясним. "
+        "/status journal покажет, есть ли подпись в журнале "
+        "(дальше /withdraw confirm при необходимости)."
+    )
+    reply("\n".join(lines))
 
 
 def ops_kwargs() -> dict[str, Any]:
@@ -304,6 +374,7 @@ def open_with_budget(
     max_bin = int(params.get("maxBinId"))
     price = float(params.get("usdcPerSol") or pool_meta.get("usdcPerSol") or 0)
 
+    require_not_frozen(reply=notes, where="перед свопом при открытии")
     swap_ok = apply_swap_suggestion(suggestion.get("swapSuggestion"), notes)
     _, usdc_have, usable_sol = _wallet_balances()
 
@@ -361,6 +432,7 @@ def open_with_budget(
     body = f"{need_sol:.6f} SOL + ${need_usdc:.4f} USDC"
     detail = notes.render()
     reply(f"{head}\n{body}" + (f"\n{detail}" if detail else ""))
+    require_not_frozen(reply=reply, where="перед отправкой открытия")
     payload = meteora_exec.exec_open(
         owner(),
         need_sol,
@@ -571,30 +643,89 @@ def rebalance_position(
     crash_after_close: bool = False,
     auto: bool = False,
 ) -> dict | None:
-    """Close → mark reopen_pending → swap/open new range around current activeId."""
+    """Close → mark reopen_pending → swap/open new range around current activeId.
+
+    reopen_pending is set only after a confirmed close, or when close confirmation
+    is unknown (must block). A clean close failure leaves the flag unset.
+    """
+    require_max_position_on_mainnet(reply=reply)
+
     pk = position["pubkey"]
     pool = meteora_ops.pool_info(**ops_kwargs())
     price = float(pool.get("usdcPerSol") or 0)
     close_value = position_value_usd(position, price)
     trigger = "auto" if auto else "manual"
+    pending_meta = {
+        "closed_position": pk,
+        "close_value_usd": close_value,
+        "price": price,
+        "trigger": trigger,
+    }
+
+    try:
+        close_position_full(
+            position, reply=reply, record_cycle=True, trigger=trigger
+        )
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except MeteoraExecError as e:
+        if _close_proven_not_sent(e):
+            reply(
+                "❌ Закрытие не прошло — позиция на месте, reopen_pending НЕ ставил. "
+                "Ничего дополнительно делать не нужно, можно повторить позже.\n"
+                f"Причина: {escape_html(e)}"
+            )
+            raise
+        sigs = _signatures_from_exec_error(e)
+        set_reopen_pending(
+            True,
+            meta={
+                **pending_meta,
+                "close_status": "unknown",
+                "signatures": sigs,
+                "error_type": type(e).__name__,
+                "error": str(e)[:400],
+            },
+        )
+        _reply_close_outcome_unknown(reply, signatures=sigs, detail=str(e)[:200])
+        raise
+    except Exception as e:
+        # Timeout, empty stdout, crash mid-flight — tx may already be in flight.
+        set_reopen_pending(
+            True,
+            meta={
+                **pending_meta,
+                "close_status": "unknown",
+                "signatures": [],
+                "error_type": type(e).__name__,
+                "error": str(e)[:400],
+            },
+        )
+        _reply_close_outcome_unknown(
+            reply,
+            signatures=[],
+            detail=f"{type(e).__name__}: {e}",
+        )
+        raise
 
     set_reopen_pending(
         True,
-        meta={
-            "closed_position": pk,
-            "close_value_usd": close_value,
-            "price": price,
-            "trigger": trigger,
-        },
-    )
-
-    close_position_full(
-        position, reply=reply, record_cycle=True, trigger=trigger
+        meta={**pending_meta, "close_status": "confirmed"},
     )
 
     if crash_after_close or os.environ.get("METEORA_CRASH_AFTER_CLOSE") == "1":
         reply("💥 crash_after_close: останавливаюсь с reopen_pending")
         raise SystemExit(42)
+
+    try:
+        require_not_frozen(reply=reply, where="после закрытия, перед свопом/открытием")
+    except StopRequested:
+        reply(
+            "🛑 /stop после закрытия: новую позицию не открываю. "
+            "Капитал на кошельке, reopen_pending остаётся. "
+            "Продолжение: /boevoy затем /open."
+        )
+        return None
 
     bal = meteora_ops.balances(owner(), **ops_kwargs())
     sol_ui = float((bal.get("sol") or {}).get("ui") or 0)
@@ -613,7 +744,14 @@ def rebalance_position(
     budget = apply_max_position_cap(budget, reply=reply, action="реоткрываю")
     reply(f"🔁 Реоткрытие на ~${budget:.2f}…")
     try:
+        require_not_frozen(reply=reply, where="перед открытием после закрытия")
         payload = open_with_budget(budget, reply=reply)
+    except StopRequested:
+        reply(
+            "🛑 /stop: открытие не отправлял. Капитал на кошельке, "
+            "reopen_pending остаётся. /boevoy затем /open."
+        )
+        return None
     except SwapFailedOpenAborted as e:
         reply(
             f"❌ Реоткрытие отменено ({e}). reopen_pending остаётся — "
