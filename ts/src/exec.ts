@@ -29,6 +29,7 @@ import {
   appendJournalEntry,
   defaultJournalPath,
   hasUnresolved,
+  isTransientRpcError,
   pollSignatureStatus,
   readJournal,
   resolveJournalOnStartup,
@@ -373,16 +374,35 @@ async function main(): Promise<void> {
     const connection = new Connection(rpc, "confirmed");
     const journalPath = defaultJournalPath();
     const pollMs = Number(flagStr(flags, "poll-ms") || "1500");
-    const timeoutMs = Number(flagStr(flags, "timeout-ms") || "60000");
+    // Default 25s per sig; wall budget shared so N stuck sigs still finish.
+    const perSigTimeout = Number(flagStr(flags, "timeout-ms") || "25000");
+    const wallMs = Number(flagStr(flags, "wall-ms") || "170000");
     eprint(`resolve-journal rpc=${rpcHostForLog(rpc)} journal=${journalPath}`);
     const before = unresolvedEntries(readJournal(journalPath));
+    const wallStart = Date.now();
+    let rpcDownHint: string | null = null;
     for (const e of before) {
+      const remaining = wallMs - (Date.now() - wallStart);
+      if (remaining < 2_000) {
+        eprint("resolve-journal: wall budget exhausted — leaving rest unresolved");
+        break;
+      }
+      const thisTimeout = Math.min(perSigTimeout, remaining);
       const { outcome, slot, error } = await pollSignatureStatus(
         connection,
         e.signature,
-        timeoutMs,
+        thisTimeout,
         pollMs
       );
+      if (
+        outcome === "unknown" &&
+        error &&
+        isTransientRpcError(error)
+      ) {
+        rpcDownHint =
+          "RPC unreachable or flaky — retry /status journal when the node is up, " +
+          "or check explorer and /status journal-forget <sig> confirm if the tx is final.";
+      }
       if (outcome === "confirmed") {
         updateJournalBySignature(journalPath, e.signature, {
           status: "confirmed",
@@ -416,6 +436,7 @@ async function main(): Promise<void> {
           explorer: explorerTxUrl(e.signature, network),
         })),
         cleared: before.length - after.length,
+        rpcHint: rpcDownHint,
       }) + "\n"
     );
     return;

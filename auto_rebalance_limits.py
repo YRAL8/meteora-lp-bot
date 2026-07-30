@@ -10,8 +10,10 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parent
-STATE_PATH = ROOT / "state" / "auto_rebalance.json"
+import state_paths  # noqa: E402
+
+# Tests may patch this; otherwise follow METEORA_STATE_DIR / state_paths.
+STATE_PATH = state_paths.path("auto_rebalance.json")
 
 
 def _utc_now() -> datetime:

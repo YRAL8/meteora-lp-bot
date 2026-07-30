@@ -158,7 +158,11 @@ class JournalForget(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            with patch.object(meteora_exec, "ROOT", Path(td)):
+            with patch.object(meteora_exec, "exec_journal_path", lambda: jp), patch.object(
+                meteora_exec,
+                "exec_journal_lock_path",
+                lambda: state / "exec_journal.lock",
+            ):
                 # Confirmed on-chain → refuse
                 with patch("urllib.request.urlopen") as urlopen:
                     class _Resp:

@@ -23,10 +23,20 @@ POOL_FEE_PCT = 0.0004
 NETWORK_FEE_LAMPORTS_EST = 41_000
 LAMPORTS_PER_SOL = 1_000_000_000
 
-ROOT = Path(__file__).resolve().parent
-DEFAULT_DATA_DIR = str(ROOT / "state")
+import state_paths
+
+ROOT = state_paths.ROOT
 STATE_FILENAME = "cycle_state.json"
 JOURNAL_FILENAME = "cycle_journal.jsonl"
+
+
+def default_data_dir() -> str:
+    return str(state_paths.state_dir())
+
+
+# Back-compat alias (resolved at import; prefer default_data_dir()).
+DEFAULT_DATA_DIR = default_data_dir()
+
 MAX_JOURNAL_RECORDS = 5000
 MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 
@@ -511,7 +521,7 @@ _DEFAULT: CycleJournal | None = None
 def get_default_journal() -> CycleJournal:
     global _DEFAULT
     if _DEFAULT is None:
-        _DEFAULT = CycleJournal(data_dir=DEFAULT_DATA_DIR)
+        _DEFAULT = CycleJournal(data_dir=default_data_dir())
     return _DEFAULT
 
 

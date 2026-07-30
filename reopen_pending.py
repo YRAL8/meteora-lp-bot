@@ -3,27 +3,40 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path  # noqa: F401 — kept for type hints in callers
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent
-REOPEN_PENDING_PATH = ROOT / "state" / "reopen_pending.json"
+import state_paths
+
+# Tests may patch this Path.
+REOPEN_PENDING_PATH = state_paths.path("reopen_pending.json")
+
+
+class ReopenPendingWriteError(OSError):
+    """Raised when reopen_pending cannot be persisted after a confirmed close."""
 
 
 def set_reopen_pending(pending: bool, *, meta: dict[str, Any] | None = None) -> None:
-    REOPEN_PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not pending:
-        if REOPEN_PENDING_PATH.is_file():
-            REOPEN_PENDING_PATH.unlink()
-        return
-    payload = {
-        "pending": True,
-        "set_at": datetime.now(timezone.utc).isoformat(),
-        **(meta or {}),
-    }
-    REOPEN_PENDING_PATH.write_text(
-        json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
+    """Write or clear the flag. Propagates OSError (disk full / read-only)."""
+    path = REOPEN_PENDING_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not pending:
+            if path.is_file():
+                path.unlink()
+            return
+        payload = {
+            "pending": True,
+            "set_at": datetime.now(timezone.utc).isoformat(),
+            **(meta or {}),
+        }
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    except OSError as e:
+        raise ReopenPendingWriteError(
+            f"cannot write reopen_pending at {path}: {e}"
+        ) from e
 
 
 def is_reopen_pending() -> bool:

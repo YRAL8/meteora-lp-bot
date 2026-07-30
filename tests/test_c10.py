@@ -168,9 +168,13 @@ class WithdrawClearsFlagOnlyAfterClose(unittest.IsolatedAsyncioTestCase):
                     "telegram_commands.meteora_ops.pool_info",
                     return_value={"usdcPerSol": 100.0},
                 ):
-                    update, _msg, ctx = _update_with_args(["confirm"])
-                    await tg.withdraw_command(update, ctx)
+                    with patch.object(tg, "WITHDRAW_LOCK_WAIT_SEC", 0.15):
+                        update, msg, ctx = _update_with_args(["confirm"])
+                        await tg.withdraw_command(update, ctx)
             self.assertTrue(is_reopen_pending())
+            self.assertTrue(
+                any("Не дождался" in r or "замка" in r for r in msg.replies)
+            )
         finally:
             bot_state.money_lock.release()
 

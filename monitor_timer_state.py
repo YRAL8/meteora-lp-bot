@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent
-STATE_PATH = ROOT / "state" / "monitor_timers.json"
+import state_paths
+
+STATE_PATH = state_paths.path("monitor_timers.json")
 
 log = logging.getLogger(__name__)
 

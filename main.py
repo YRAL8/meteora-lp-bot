@@ -36,6 +36,51 @@ out_of_range_since: Optional[datetime] = None
 last_auto_attempt_at: Optional[datetime] = None
 rebalance_blocked_alert_sent = False
 rebalance_blocked_last_alert_at: Optional[datetime] = None
+_last_monitor_tick_at: Optional[datetime] = None
+_monitor_watchdog_alerted = False
+
+
+def _format_unresolved_journal_alert(
+    unresolved: list[dict], *, where: str
+) -> str:
+    import meteora_exec
+
+    lines = [
+        f"⚠️ <b>Неразрешённые записи в журнале отправок</b> ({where})",
+        f"Подписей: {len(unresolved)}. Исход этих tx неизвестен — "
+        "не начинай новые денежные операции вслепую.",
+        "Что делать: /status journal (опрос сети). Если RPC лежит — подожди узел "
+        "или проверь explorer и /status journal-forget &lt;sig&gt; confirm.",
+        "",
+    ]
+    for u in unresolved[:8]:
+        sig = escape_html(str(u.get("signature") or "?"))
+        st = escape_html(str(u.get("status") or "?"))
+        act = escape_html(str(u.get("action") or "?"))
+        lines.append(f"• <code>{sig}</code> ({st}, {act})")
+    return "\n".join(lines)
+
+
+def _check_unresolved_journal(*, where: str, now: datetime) -> bool:
+    """Return True if unresolved entries exist (and optionally alert)."""
+    import meteora_exec
+
+    try:
+        unresolved = meteora_exec.list_unresolved_journal()
+    except OSError:
+        log.warning("cannot read exec journal", exc_info=True)
+        return False
+    if not unresolved:
+        return False
+    if _should_send_blocked_reminder(now):
+        send_telegram_message(
+            _format_unresolved_journal_alert(unresolved, where=where)
+        )
+        _mark_blocked_reminder_sent(now)
+    log.warning(
+        "unresolved journal entries=%s where=%s", len(unresolved), where
+    )
+    return True
 
 
 def _persist_timers() -> None:
@@ -108,7 +153,8 @@ def _maybe_warn_uneconomic(pos: dict, usdc_per_sol: float) -> None:
     median = ar_limits.median_cycle_hours(cycles)
     if median is None:
         return
-    payback = bot_config.REBALANCE_PAYBACK_HOURS
+    pos_usd = money_ops.position_value_usd(pos, usdc_per_sol)
+    payback = bot_config.effective_payback_hours(pos_usd)
     if median >= payback:
         return
     st = ar_limits.load_state(now=datetime.now(timezone.utc))
@@ -121,15 +167,17 @@ def _maybe_warn_uneconomic(pos: dict, usdc_per_sol: float) -> None:
         f"⚠️ <b>Диагностика окупаемости</b> (не блокирует ребаланс)\n"
         f"Ширина ±{pct}% на этом пуле не окупает ребалансы: "
         f"медианная жизнь последних {len(cycles)} циклов "
-        f"<b>{median:.2f} ч</b> против окупаемости <b>{payback:.1f} ч</b>.\n"
+        f"<b>{median:.2f} ч</b> против окупаемости <b>{payback:.1f} ч</b> "
+        f"(для позиции ≈${pos_usd:.2f}).\n"
         f"Стоит расширить диапазон (/setrange) или сменить пул на больший binStep.\n"
-        f"Позиция сейчас ≈ ${money_ops.position_value_usd(pos, usdc_per_sol):.2f}."
+        f"Позиция сейчас ≈ ${pos_usd:.2f}."
     )
     send_telegram_message(msg)
     log.warning(
-        "uneconomic width: median_life=%.2fh payback=%.1fh (warn only)",
+        "uneconomic width: median_life=%.2fh payback=%.1fh pos=$%.2f (warn only)",
         median,
         payback,
+        pos_usd,
     )
     ar_limits.mark_uneconomic_warned(st)
 
@@ -145,7 +193,9 @@ def _tg_reply_collector(buf: list[str]):
 
 async def monitor_position(*, now: datetime | None = None) -> None:
     """One monitoring tick. `now` is injectable for offline tests."""
-    global out_of_range_since, last_auto_attempt_at
+    global out_of_range_since, last_auto_attempt_at, _last_monitor_tick_at
+
+    _last_monitor_tick_at = datetime.now(timezone.utc)
 
     if bot_state.bot_paused or bot_state.bot_frozen:
         log.info("Бот на паузе/заморожен — пропускаю тик мониторинга")
@@ -160,6 +210,9 @@ async def monitor_position(*, now: datetime | None = None) -> None:
         now = now.replace(tzinfo=timezone.utc)
 
     try:
+        if _check_unresolved_journal(where="monitor", now=now):
+            return
+
         if is_reopen_pending():
             meta = load_reopen_pending() or {}
             if _should_send_blocked_reminder(now):
@@ -350,8 +403,9 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                 log.warning("MAX_REBALANCES_PER_DAY reached — auto paused for today")
             return
 
-        # Low SOL: compare available to needSol for the intended reopen budget
-        # (not merely > 0). Estimate post-close wallet ≈ current + position legs.
+        # Low SOL: compare post-swap availability to needSol. Rebalance always
+        # runs the planned USDC↔SOL swap; blocking on pre-swap SOL alone freezes
+        # every upward exit (position all USDC).
         bal = meteora_ops.balances(owner, **kw)
         sol_ui = float((bal.get("sol") or {}).get("ui") or 0)
         usdc_ui = float((bal.get("usdc") or {}).get("ui") or 0)
@@ -377,27 +431,29 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                     "suggest-amounts for SOL gate failed — fallback usable_sol>0",
                     exc_info=True,
                 )
-        short_sol = False
-        if need_sol is not None:
-            short_sol = est_sol + 1e-12 < need_sol or est_budget < 0.05
-        else:
-            # Degraded: cannot price needSol (offline tests / RPC blip).
-            short_sol = usable_sol <= 0 or est_budget < 0.05
+        short_sol = money_ops.sol_short_after_planned_swap(
+            est_sol=est_sol,
+            est_usdc=est_usdc,
+            est_budget=est_budget,
+            need_sol=need_sol,
+            price=price2,
+        )
         if short_sol:
             if _should_send_blocked_reminder(now):
                 need_s = f"{need_sol:.4f}" if need_sol is not None else "?"
                 send_telegram_message(
-                    f"⚠️ <b>Авто-ребаланс отложен — мало SOL под пропорцию</b>\n"
-                    f"оценка после close: SOL≈{est_sol:.4f}, needSol≈{need_s}, "
-                    f"бюджет≈${est_budget:.2f} "
+                    f"⚠️ <b>Авто-ребаланс отложен — мало бюджета/SOL даже после свопа</b>\n"
+                    f"оценка после close: SOL≈{est_sol:.4f}, USDC≈{est_usdc:.2f}, "
+                    f"needSol≈{need_s}, бюджет≈${est_budget:.2f} "
                     f"(сейчас solAvailableForOpen={usable_sol:.4f}).\n"
                     f"Вне диапазона уже {minutes_out:.0f} мин. "
                     f"Таймер не сброшен — повторю на следующем тике."
                 )
                 _mark_blocked_reminder_sent(now)
             log.warning(
-                "Мало SOL под needSol est_sol=%.4f need=%s budget=%.2f — отложен",
+                "Мало SOL даже после свопа est_sol=%.4f est_usdc=%.2f need=%s budget=%.2f — отложен",
                 est_sol,
+                est_usdc,
                 need_sol,
                 est_budget,
             )
@@ -546,6 +602,22 @@ async def main() -> None:
         )
     log.info("=" * 50)
 
+    # Live mainnet without a real state mount must not start (C12).
+    if (
+        not persistent
+        and bot_config.effective_network() == "mainnet"
+        and not bot_config.DRY_RUN
+    ):
+        msg = (
+            "🛑 <b>Старт запрещён: нет нормального тома /app/state на mainnet</b>\n"
+            f"{escape_html(state_line)}\n"
+            "Без тома пропадут reopen_pending, журнал и штормовые счётчики. "
+            "Смонтируй -v …:/app/state и перезапусти."
+        )
+        log.error("refusing mainnet start without persistent state: %s", state_line)
+        send_telegram_message(msg)
+        raise SystemExit(2)
+
     if is_reopen_pending():
         meta = load_reopen_pending() or {}
         log.error("REOPEN_PENDING при старте: %s", meta)
@@ -557,6 +629,16 @@ async def main() -> None:
             "Если позиции нет — /open; иначе не открывай вторую. "
             "Журнал: /status journal."
         )
+
+    try:
+        unresolved = __import__("meteora_exec").list_unresolved_journal()
+    except OSError:
+        unresolved = []
+    if unresolved:
+        send_telegram_message(
+            _format_unresolved_journal_alert(unresolved, where="startup")
+        )
+        log.error("unresolved journal at startup: %s", len(unresolved))
 
     if (
         bot_config.AUTO_REBALANCE
@@ -575,6 +657,31 @@ async def main() -> None:
         while True:
             await monitor_position()
             await asyncio.sleep(bot_config.POLL_INTERVAL_SEC)
+
+    async def _monitor_watchdog() -> None:
+        global _monitor_watchdog_alerted
+        # Alert if no tick for ~3 poll intervals + 90s slack.
+        limit_sec = max(90.0, bot_config.POLL_INTERVAL_SEC * 3 + 90.0)
+        while True:
+            await asyncio.sleep(30)
+            if _last_monitor_tick_at is None:
+                continue
+            age = (
+                datetime.now(timezone.utc) - _last_monitor_tick_at
+            ).total_seconds()
+            if age > limit_sec:
+                if not _monitor_watchdog_alerted:
+                    send_telegram_message(
+                        "🚨 <b>Монитор не отвечает</b>\n"
+                        f"Последний тик был {age / 60.0:.1f} мин назад "
+                        f"(порог {limit_sec / 60.0:.1f} мин).\n"
+                        "Команды Telegram могут работать, но слежения за позицией нет. "
+                        "Перезапусти процесс бота."
+                    )
+                    _monitor_watchdog_alerted = True
+                    log.error("monitor watchdog: last tick %.0fs ago", age)
+            else:
+                _monitor_watchdog_alerted = False
 
     app = None
     can_start_telegram = False
@@ -627,7 +734,28 @@ async def main() -> None:
                 "/addliquidity /open /pauza /stop /boevoy /withdraw"
             )
 
-            monitor_task = asyncio.create_task(_monitor_loop())
+            monitor_task = asyncio.create_task(_monitor_loop(), name="monitor")
+            watchdog_task = asyncio.create_task(
+                _monitor_watchdog(), name="monitor-watchdog"
+            )
+
+            def _on_monitor_done(task: asyncio.Task) -> None:
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    log.error(
+                        "monitor task died: %s",
+                        exc,
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+                    send_telegram_message(
+                        "🚨 <b>Задача монитора упала</b>\n"
+                        f"{escape_html(type(exc).__name__)}: {escape_html(exc)}\n"
+                        "Слежение остановлено — перезапусти бота."
+                    )
+
+            monitor_task.add_done_callback(_on_monitor_done)
             try:
                 while True:
                     await asyncio.sleep(1)
@@ -635,8 +763,13 @@ async def main() -> None:
                 log.info("Остановка по сигналу")
             finally:
                 monitor_task.cancel()
+                watchdog_task.cancel()
                 try:
                     await monitor_task
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    await watchdog_task
                 except asyncio.CancelledError:
                     pass
                 await app.updater.stop()

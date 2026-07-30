@@ -11,9 +11,42 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import config
+import state_paths
 
 ROOT = Path(__file__).resolve().parent
 EXEC_JS = ROOT / "ts" / "dist" / "exec.js"
+
+
+def exec_journal_path() -> Path:
+    return state_paths.path("exec_journal.jsonl")
+
+
+def exec_journal_lock_path() -> Path:
+    return state_paths.path("exec_journal.lock")
+
+
+def list_unresolved_journal() -> List[Dict[str, Any]]:
+    """Latest row per signature still pending/unknown (no RPC)."""
+    journal_path = exec_journal_path()
+    if not journal_path.is_file():
+        return []
+    by_sig: Dict[str, Dict[str, Any]] = {}
+    for line in journal_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        sig = str(e.get("signature") or "")
+        if not sig:
+            continue
+        by_sig[sig] = e
+    return [
+        e
+        for e in by_sig.values()
+        if e.get("status") in ("pending", "unknown")
+    ]
 
 
 class MeteoraExecError(RuntimeError):
@@ -282,14 +315,19 @@ def exec_swap(
 
 def resolve_journal(
     *,
-    timeout_ms: int = 60_000,
+    timeout_ms: int = 25_000,
     network: str = "devnet",
     rpc: Optional[str] = None,
     pool: Optional[str] = None,
     extra_env: Optional[Dict[str, str]] = None,
-    timeout_s: float = 120.0,
+    timeout_s: float = 180.0,
 ) -> Dict[str, Any]:
-    """Re-poll unresolved journal entries (no send). Chat-reachable unlock step 1."""
+    """Re-poll unresolved journal entries (no send). Chat-reachable unlock step 1.
+
+    Per-signature poll budget defaults to 25s; whole subprocess 180s so several
+    stuck signatures still fit. If RPC is down, returns error — owner should
+    retry later or use journal-forget after checking explorer offline.
+    """
     return run_exec(
         ["resolve-journal", "--timeout-ms", str(int(timeout_ms))],
         send=False,
@@ -314,10 +352,11 @@ def forget_unresolved_journal(
     Mass forget is intentionally removed (C9). Does NOT send transactions.
     Writes under a file lock via temp+replace (C10).
     """
-    import fcntl
     import urllib.error
     import urllib.request
     from datetime import datetime, timezone
+
+    import journal_lock
 
     sig = (signature or "").strip()
     if not sig:
@@ -333,8 +372,8 @@ def forget_unresolved_journal(
         else:
             rpc = os.environ.get("SOLANA_RPC_URL", config.solana_rpc_url())
 
-    journal_path = ROOT / "state" / "exec_journal.jsonl"
-    lock_path = ROOT / "state" / "exec_journal.lock"
+    journal_path = exec_journal_path()
+    lock_path = exec_journal_lock_path()
     if not journal_path.is_file():
         return {"ok": False, "error": "journal empty", "cleared": 0}
 
@@ -346,7 +385,6 @@ def forget_unresolved_journal(
             try:
                 entries.append(json.loads(line))
             except json.JSONDecodeError:
-                # Corrupt line — keep a stub so rewrite does not drop neighbours.
                 entries.append(
                     {
                         "signature": "",
@@ -359,13 +397,15 @@ def forget_unresolved_journal(
 
     def _atomic_write(entries: List[Dict[str, Any]]) -> None:
         body_out = "\n".join(json.dumps(e, ensure_ascii=False) for e in entries)
-        tmp = journal_path.with_suffix(".jsonl.tmp")
+        tmp = journal_path.parent / (
+            f"{journal_path.name}.{os.getpid()}."
+            f"{int(datetime.now(timezone.utc).timestamp() * 1000)}.tmp"
+        )
         tmp.write_text(body_out + ("\n" if body_out else ""), encoding="utf-8")
         tmp.replace(journal_path)
 
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a+", encoding="utf-8") as lock_f:
-        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+    journal_lock.acquire_journal_lock(lock_path)
+    try:
         entries = _read_entries()
 
         target: Optional[Dict[str, Any]] = None
@@ -499,6 +539,8 @@ def forget_unresolved_journal(
             "outcome": "not_found_expired",
             "age_sec": age_sec,
         }
+    finally:
+        journal_lock.release_journal_lock(lock_path)
 
 
 def main() -> None:

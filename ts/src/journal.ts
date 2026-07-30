@@ -19,9 +19,95 @@ export type JournalEntry = {
 export const UNRESOLVED_STATUSES: JournalStatus[] = ["pending", "unknown"];
 
 export function defaultJournalPath(projectRoot?: string): string {
-  const root =
-    projectRoot || path.resolve(__dirname, "..", "..");
+  const envDir = (process.env.METEORA_STATE_DIR || "").trim();
+  if (envDir) {
+    return path.join(envDir, "exec_journal.jsonl");
+  }
+  const root = projectRoot || path.resolve(__dirname, "..", "..");
   return path.join(root, "state", "exec_journal.jsonl");
+}
+
+export function journalLockPath(journalPath: string): string {
+  if (journalPath.endsWith(".jsonl")) {
+    return journalPath.slice(0, -".jsonl".length) + ".lock";
+  }
+  return `${journalPath}.lock`;
+}
+
+function sleepMs(ms: number): void {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    /* spin — sync lock helper must not yield */
+  }
+}
+
+function breakStaleLock(lockPath: string): boolean {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(lockPath, "utf8").trim();
+  } catch {
+    return false;
+  }
+  const pid = Number.parseInt(raw.split("\n")[0] || "", 10);
+  if (!Number.isFinite(pid)) {
+    try {
+      fs.unlinkSync(lockPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    process.kill(pid, 0);
+    return false; // alive
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") {
+      try {
+        fs.unlinkSync(lockPath);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+}
+
+/**
+ * Exclusive lock shared with Python ``journal_lock.py`` (O_EXCL lockfile).
+ */
+export function withFileLockSync<T>(lockPath: string, fn: () => T): T {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  const start = Date.now();
+  for (;;) {
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      try {
+        fs.writeFileSync(fd, `${process.pid}\n`, "utf8");
+      } finally {
+        fs.closeSync(fd);
+      }
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw err;
+      if (breakStaleLock(lockPath)) continue;
+      if (Date.now() - start > 60_000) {
+        throw new Error(`journal lock timeout: ${lockPath}`);
+      }
+      sleepMs(50);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 export function readJournal(journalPath: string): JournalEntry[] {
@@ -40,13 +126,21 @@ export function readJournal(journalPath: string): JournalEntry[] {
   return entries;
 }
 
+function uniqueTmpPath(journalPath: string): string {
+  return `${journalPath}.${process.pid}.${Date.now()}.${Math.random()
+    .toString(16)
+    .slice(2)}.tmp`;
+}
+
 export function writeJournal(journalPath: string, entries: JournalEntry[]): void {
   const dir = path.dirname(journalPath);
   fs.mkdirSync(dir, { recursive: true });
   const body = entries.map((e) => JSON.stringify(e)).join("\n");
-  const tmp = `${journalPath}.tmp`;
-  fs.writeFileSync(tmp, body ? body + "\n" : "", "utf8");
-  fs.renameSync(tmp, journalPath);
+  const tmp = uniqueTmpPath(journalPath);
+  withFileLockSync(journalLockPath(journalPath), () => {
+    fs.writeFileSync(tmp, body ? body + "\n" : "", "utf8");
+    fs.renameSync(tmp, journalPath);
+  });
 }
 
 export function appendJournalEntry(
@@ -55,7 +149,9 @@ export function appendJournalEntry(
 ): void {
   const dir = path.dirname(journalPath);
   fs.mkdirSync(dir, { recursive: true });
-  fs.appendFileSync(journalPath, JSON.stringify(entry) + "\n", "utf8");
+  withFileLockSync(journalLockPath(journalPath), () => {
+    fs.appendFileSync(journalPath, JSON.stringify(entry) + "\n", "utf8");
+  });
 }
 
 export function updateJournalBySignature(
@@ -63,19 +159,26 @@ export function updateJournalBySignature(
   signature: string,
   patch: Partial<JournalEntry>
 ): void {
-  const entries = readJournal(journalPath);
-  let found = false;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i].signature === signature) {
-      entries[i] = { ...entries[i], ...patch };
-      found = true;
-      break;
+  withFileLockSync(journalLockPath(journalPath), () => {
+    const entries = readJournal(journalPath);
+    let found = false;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (entries[i].signature === signature) {
+        entries[i] = { ...entries[i], ...patch };
+        found = true;
+        break;
+      }
     }
-  }
-  if (!found) {
-    throw new Error(`journal entry not found for signature ${signature}`);
-  }
-  writeJournal(journalPath, entries);
+    if (!found) {
+      throw new Error(`journal entry not found for signature ${signature}`);
+    }
+    const dir = path.dirname(journalPath);
+    fs.mkdirSync(dir, { recursive: true });
+    const body = entries.map((e) => JSON.stringify(e)).join("\n");
+    const tmp = uniqueTmpPath(journalPath);
+    fs.writeFileSync(tmp, body ? body + "\n" : "", "utf8");
+    fs.renameSync(tmp, journalPath);
+  });
 }
 
 export function latestEntryBySignature(
@@ -143,13 +246,10 @@ export async function pollSignatureStatus(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       lastError = msg;
-      // Temporary network blip: keep polling until the window is exhausted.
       if (isTransientRpcError(msg)) {
         await new Promise((r) => setTimeout(r, pollMs));
         continue;
       }
-      // Non-transient RPC error — still wait out the window once; do not
-      // treat a single hiccup as definitive "unknown" if time remains.
       await new Promise((r) => setTimeout(r, pollMs));
       continue;
     }
@@ -201,7 +301,6 @@ export async function resolveJournalOnStartup(
       });
       resolved.push({ ...e, status: "failed", slot, error });
     }
-    // unknown stays unknown — do not auto-retry send
   }
   return { entries: readJournal(journalPath), resolved };
 }

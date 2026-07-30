@@ -64,8 +64,9 @@ ALLOW_MULTI_TX_ADD=false
 # Helius "medium" / reliable inclusion without overpaying. Override if congested.
 PRIORITY_FEE_MICROLAMPORTS=50000
 
-# Payback diagnosis only (never blocks). Median cycle life vs ~2.8h payback
-# (swap ≈0.02% of position / in-range earn ≈0.0071%/h).
+# Payback diagnosis only (never blocks). Large position asymptote ≈2.8h
+# (swap ≈0.02% / earn ≈0.0071%/h). Small sizes scale up via fixed fee share
+# (see bot_config.effective_payback_hours).
 REBALANCE_PAYBACK_HOURS=2.8
 UNECONOMIC_LOOKBACK_CYCLES=5
 

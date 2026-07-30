@@ -88,13 +88,34 @@ PRIORITY_FEE_MICROLAMPORTS = int(os.getenv("PRIORITY_FEE_MICROLAMPORTS", "50000"
 if PRIORITY_FEE_MICROLAMPORTS < 0:
     raise ValueError("PRIORITY_FEE_MICROLAMPORTS must be >= 0")
 
-# Payback diagnosis (warn only, never blocks). Swap cost ≈0.02% of position;
-# in-range earn ≈0.0071%/h → payback ≈2.8h. If median cycle life stays below
-# this, the width/pool choice is wrong — tell the owner, still rebalance.
+# Payback diagnosis (warn only, never blocks). Large-position asymptote ≈2.8h
+# (swap ~0.02% / earn ~0.0071%/h). Small positions pay more fixed network cost
+# as a fraction of size — use effective_payback_hours(position_usd).
 REBALANCE_PAYBACK_HOURS = float(os.getenv("REBALANCE_PAYBACK_HOURS", "2.8"))
+# Fixed USD cost per rebalance cycle (priority fees + base sig cost estimate).
+REBALANCE_FIXED_COST_USD = float(os.getenv("REBALANCE_FIXED_COST_USD", "0.005"))
+# Variable cost fraction of position (swap + pool fee estimate).
+REBALANCE_VARIABLE_COST_FRAC = float(
+    os.getenv("REBALANCE_VARIABLE_COST_FRAC", "0.0002")
+)
+# In-range fee earn rate as fraction of position per hour.
+REBALANCE_EARN_FRAC_PER_HOUR = float(
+    os.getenv("REBALANCE_EARN_FRAC_PER_HOUR", "0.000071")
+)
 UNECONOMIC_LOOKBACK_CYCLES = int(os.getenv("UNECONOMIC_LOOKBACK_CYCLES", "5"))
 if UNECONOMIC_LOOKBACK_CYCLES < 1:
     raise ValueError("UNECONOMIC_LOOKBACK_CYCLES must be >= 1")
+
+
+def effective_payback_hours(position_usd: float) -> float:
+    """Hours to earn back one rebalance, scaled by position size.
+
+    cost_frac = variable + fixed_usd/position; payback = cost_frac / earn_per_h.
+    """
+    pos = max(float(position_usd), 1.0)
+    earn = max(REBALANCE_EARN_FRAC_PER_HOUR, 1e-12)
+    cost_frac = REBALANCE_VARIABLE_COST_FRAC + (REBALANCE_FIXED_COST_USD / pos)
+    return cost_frac / earn
 
 
 def dry_run() -> bool:

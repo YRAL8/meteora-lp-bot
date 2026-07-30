@@ -268,7 +268,8 @@ class SolGateUsesAvailable(unittest.IsolatedAsyncioTestCase):
         main_mod.out_of_range_since = None
         main_mod.last_auto_attempt_at = None
 
-    async def test_zero_available_blocks(self) -> None:
+    async def test_zero_wallet_sol_still_runs_when_position_can_swap(self) -> None:
+        """C12: solAvailableForOpen=0 must not block if post-close legs can swap."""
         t0 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
         main_mod.out_of_range_since = t0 - timedelta(minutes=30)
         main_mod.last_auto_attempt_at = None
@@ -294,6 +295,7 @@ class SolGateUsesAvailable(unittest.IsolatedAsyncioTestCase):
             patch.object(bot_config, "MAX_POSITION_USD", 50.0),
             patch.object(bot_config, "effective_network", return_value="devnet"),
             patch("main.is_reopen_pending", return_value=False),
+            patch("main._check_unresolved_journal", return_value=False),
             patch("main.money_ops.get_primary_position", return_value=pos),
             patch("main.meteora_ops.pool_info", return_value=pool),
             patch(
@@ -303,6 +305,67 @@ class SolGateUsesAvailable(unittest.IsolatedAsyncioTestCase):
                     "usdc": {"ui": 10},
                     "solAvailableForOpen": 0.0,
                 },
+            ),
+            patch(
+                "main.money_ops.suggest_for_budget",
+                return_value={"needSol": 0.05, "needUsdc": 5.0},
+            ),
+            patch("main.ar_limits.load_state") as ls,
+            patch("main.money_ops.rebalance_position", return_value={"ok": True}) as reb,
+            patch("main.send_telegram_message"),
+            patch("main.bot_config.wallet_pubkey", return_value="W"),
+            patch("main._maybe_warn_uneconomic"),
+            patch("main.ar_limits.record_rebalance"),
+        ):
+            lim = MagicMock()
+            lim.count_today = 0
+            lim.day_utc = "2026-07-29"
+            lim.ensure_day = MagicMock()
+            ls.return_value = lim
+            with patch("main.ar_limits.minutes_since_last", return_value=None):
+                await main_mod.monitor_position(now=t0)
+            reb.assert_called_once()
+
+    async def test_truly_short_budget_blocks(self) -> None:
+        t0 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
+        main_mod.out_of_range_since = t0 - timedelta(minutes=30)
+        main_mod.last_auto_attempt_at = None
+        pos = {
+            "pubkey": "P",
+            "lowerBinId": 1,
+            "upperBinId": 3,
+            "sol": 0.0,
+            "usdc": 0.01,
+            "fees": {},
+        }
+        pool = {
+            "activeId": 99,
+            "binStep": 1,
+            "usdcPerSol": 100.0,
+            "maxBinsPerPosition": 70,
+        }
+        with (
+            patch.object(bot_config, "AUTO_REBALANCE", True),
+            patch.object(bot_config, "REBALANCE_DELAY_MIN", 20),
+            patch.object(bot_config, "MIN_REBALANCE_INTERVAL_MIN", 0),
+            patch.object(bot_config, "MAX_REBALANCES_PER_DAY", 6),
+            patch.object(bot_config, "MAX_POSITION_USD", 50.0),
+            patch.object(bot_config, "effective_network", return_value="devnet"),
+            patch("main.is_reopen_pending", return_value=False),
+            patch("main._check_unresolved_journal", return_value=False),
+            patch("main.money_ops.get_primary_position", return_value=pos),
+            patch("main.meteora_ops.pool_info", return_value=pool),
+            patch(
+                "main.meteora_ops.balances",
+                return_value={
+                    "sol": {"ui": 0.0},
+                    "usdc": {"ui": 0.0},
+                    "solAvailableForOpen": 0.0,
+                },
+            ),
+            patch(
+                "main.money_ops.suggest_for_budget",
+                return_value={"needSol": 0.05, "needUsdc": 5.0},
             ),
             patch("main.ar_limits.load_state") as ls,
             patch("main.money_ops.rebalance_position") as reb,
@@ -318,7 +381,7 @@ class SolGateUsesAvailable(unittest.IsolatedAsyncioTestCase):
                 await main_mod.monitor_position(now=t0)
             reb.assert_not_called()
             texts = " ".join(str(c.args[0]) for c in tg.call_args_list)
-            self.assertIn("solAvailableForOpen", texts)
+            self.assertTrue("своп" in texts.lower() or "бюджет" in texts.lower() or "SOL" in texts)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,9 @@ from telegram_notify import (
 
 log = logging.getLogger(__name__)
 
+# Emergency /withdraw waits this long for money_lock (C12).
+WITHDRAW_LOCK_WAIT_SEC = 600.0
+
 # Exactly Orca's owner command set (no /close, no /swap as Telegram commands).
 _OWNER_COMMANDS = (
     "status",
@@ -122,7 +125,9 @@ async def _handle_journal_block(update: Update, err: BaseException) -> bool:
             "pool": money_ops.exec_kwargs().get("pool"),
             "extra_env": money_ops.exec_kwargs().get("extra_env"),
         }
-        result = await _run_money(meteora_exec.resolve_journal, timeout_ms=60_000, **kw)
+        result = await _run_money(
+            meteora_exec.resolve_journal, timeout_ms=25_000, timeout_s=180.0, **kw
+        )
     except Exception as e:
         await _reply(update, f"❌ Не удалось опросить журнал: {e}")
         return True
@@ -200,6 +205,21 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if is_reopen_pending():
             lines.append("⚠️ <b>Ребаланс оборвался</b> между закрытием и открытием!")
 
+        try:
+            unresolved = meteora_exec.list_unresolved_journal()
+        except OSError:
+            unresolved = []
+        if unresolved:
+            lines.append(
+                f"⚠️ <b>Журнал:</b> {len(unresolved)} неразрешённых подписей — "
+                "/status journal"
+            )
+            for u in unresolved[:3]:
+                lines.append(
+                    f"• <code>{escape_html(str(u.get('signature') or '?'))}</code> "
+                    f"({escape_html(str(u.get('status') or '?'))})"
+                )
+
         if not positions:
             lines.append("⏳ Открытых позиций нет.")
             lines.append(price_line)
@@ -245,7 +265,19 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def _journal_status_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Chat unlock for stuck exec_journal — no new BotCommand (uses /status args)."""
+    """Chat unlock for stuck exec_journal — runs under money_lock (C12)."""
+    if bot_state.money_lock.locked():
+        await _reply(
+            update,
+            "⏳ Идёт другая денежная операция — /status journal подождёт в очереди…",
+        )
+    async with bot_state.money_lock:
+        await _journal_status_command_locked(update, context)
+
+
+async def _journal_status_command_locked(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     args = [a.lower() for a in (context.args or [])]
     forget = bool(args) and args[0] == "journal-forget"
     if forget:
@@ -326,12 +358,20 @@ async def _journal_status_command(
             "pool": money_ops.exec_kwargs().get("pool"),
             "extra_env": money_ops.exec_kwargs().get("extra_env"),
         }
-        result = await _run_money(meteora_exec.resolve_journal, timeout_ms=60_000, **kw)
+        result = await _run_money(
+            meteora_exec.resolve_journal, timeout_ms=25_000, timeout_s=180.0, **kw
+        )
     except Exception as e:
-        await _reply(update, f"❌ /status journal: {e}")
+        await _reply(
+            update,
+            f"❌ /status journal: {e}\n"
+            "Если RPC недоступен — подожди узел или проверь explorer, "
+            "затем /status journal-forget &lt;sig&gt; confirm.",
+        )
         return
     still = result.get("stillUnresolved") or []
     cleared = int(result.get("cleared") or 0)
+    hint = result.get("rpcHint")
     if not still:
         await _reply(
             update,
@@ -344,6 +384,9 @@ async def _journal_status_command(
         "/status journal-forget &lt;подпись&gt; confirm",
         "",
     ]
+    if hint:
+        lines.append(escape_html(str(hint)))
+        lines.append("")
     for u in still[:8]:
         sig = escape_html(u.get("signature", "?"))
         st = escape_html(u.get("status", "?"))
@@ -738,11 +781,24 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Clear reopen_pending only after a confirmed close — never before the lock
     # or the exec (audit C10: early clear left capital invisible).
+    # Emergency exit waits for the money lock (C12) instead of refusing.
+    wait_ceiling = WITHDRAW_LOCK_WAIT_SEC
     if bot_state.money_lock.locked():
-        await _reply(update, "⏳ Идёт другая денежная операция — подожди.")
+        await _reply(
+            update,
+            "⏳ Идёт другая денежная операция — аварийный /withdraw ждёт освобождения "
+            f"замка (до {int(wait_ceiling)} с)…",
+        )
+    try:
+        await asyncio.wait_for(bot_state.money_lock.acquire(), timeout=wait_ceiling)
+    except asyncio.TimeoutError:
+        await _reply(
+            update,
+            "❌ Не дождался денежного замка за "
+            f"{int(wait_ceiling)} с — повтори /withdraw confirm.",
+        )
         return
-
-    async with bot_state.money_lock:
+    try:
         replies: list[str] = []
         collector = _reply_sync_collector(replies)
 
@@ -784,6 +840,8 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if await _handle_journal_block(update, e):
                 return
             await _reply(update, f"❌ Ошибка: {e}")
+    finally:
+        bot_state.money_lock.release()
 
 
 async def rebalance_command(

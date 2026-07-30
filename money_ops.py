@@ -13,7 +13,7 @@ import meteora_ops
 import range_state
 from meteora_exec import MeteoraExecError
 from position_state import clear_last_position, save_last_position
-from reopen_pending import set_reopen_pending
+from reopen_pending import set_reopen_pending, ReopenPendingWriteError
 from telegram_notify import escape_html, format_exec_replies
 
 log = logging.getLogger(__name__)
@@ -354,6 +354,33 @@ def apply_swap_suggestion(suggestion: dict | None, reply: Callable[[str], Any]) 
         price=price,
     )
     return True
+
+
+def sol_short_after_planned_swap(
+    *,
+    est_sol: float,
+    est_usdc: float,
+    est_budget: float,
+    need_sol: float | None,
+    price: float,
+) -> bool:
+    """True if even after USDC→SOL swap we cannot fund needSol / budget.
+
+    Used by the auto-rebalance SOL gate and post-close reopen check.
+    """
+    if est_budget < 0.05:
+        return True
+    if need_sol is None:
+        # Degraded: cannot price needSol — only block if no SOL and no USDC to buy.
+        return est_sol <= 1e-12 and est_usdc <= 1e-6
+    if est_sol + 1e-12 >= need_sol:
+        return False
+    if price <= 0:
+        return True
+    deficit = need_sol - est_sol
+    # 2% cushion for fees/slippage on the swap leg.
+    need_usdc_for_swap = deficit * price * 1.02
+    return est_usdc + 1e-12 < need_usdc_for_swap
 
 
 def suggest_for_budget(
@@ -747,10 +774,21 @@ def close_position_full(
 
     # Flag first — crash window after confirm must not look like "idle".
     if reopen_after_confirm is not None:
-        set_reopen_pending(
-            True,
-            meta={**reopen_after_confirm, "close_status": "confirmed"},
-        )
+        from reopen_pending import ReopenPendingWriteError as _RPWE
+
+        try:
+            set_reopen_pending(
+                True,
+                meta={**reopen_after_confirm, "close_status": "confirmed"},
+            )
+        except _RPWE as e:
+            reply(
+                "🚨 <b>CRITICAL: не смог записать reopen_pending после закрытия</b>\n"
+                "Позиция уже закрыта, флаг на диске НЕ записан — открытие НЕ начинаю.\n"
+                f"Причина: {escape_html(e)}\n"
+                "Освободи место на томе / проверь mount, затем /status и осознанный /open."
+            )
+            raise
 
     reply(format_exec_replies(cl))
     clear_last_position()
@@ -902,7 +940,8 @@ def rebalance_position(
     # Cap applied inside open_with_budget (with announcement); preview here too.
     budget = apply_max_position_cap(budget, reply=reply, action="реоткрываю")
 
-    # SOL leg must cover suggest-amounts needSol for this budget.
+    # SOL leg: open_with_budget will swap USDC→SOL when needed. Block only if
+    # post-swap SOL still cannot meet needSol (not enough USDC either).
     try:
         sug = suggest_for_budget(budget)
         need_sol = float(sug.get("needSol") or 0)
@@ -912,12 +951,18 @@ def rebalance_position(
             "reopen_pending остаётся."
         )
         return None
-    if need_sol > 0 and usable_sol + 1e-12 < need_sol:
+    if sol_short_after_planned_swap(
+        est_sol=usable_sol,
+        est_usdc=usdc_ui,
+        est_budget=budget,
+        need_sol=need_sol,
+        price=price,
+    ):
         reply(
-            f"❌ После закрытия SOL для открытия мало: "
-            f"solAvailableForOpen={usable_sol:.4f}, needSol≈{need_sol:.4f} "
-            f"под бюджет ~${budget:.2f}. Не открываю урезанную позицию. "
-            f"reopen_pending остаётся — пополни SOL или выведи USDC, потом /open."
+            f"❌ После закрытия даже со свопом не хватает SOL: "
+            f"solAvailableForOpen={usable_sol:.4f}, USDC={usdc_ui:.2f}, "
+            f"needSol≈{need_sol:.4f} под бюджет ~${budget:.2f}. Не открываю. "
+            f"reopen_pending остаётся — пополни кошелёк, потом /open."
         )
         return None
 

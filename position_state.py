@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent
-LAST_POSITION_PATH = ROOT / "state" / "last_position.json"
+import state_paths
+
+LAST_POSITION_PATH = state_paths.path("last_position.json")
 
 
 def save_last_position(pubkey: str, pool: str) -> None:

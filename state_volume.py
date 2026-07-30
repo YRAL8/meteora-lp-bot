@@ -6,9 +6,18 @@ import os
 import re
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-STATE_DIR = ROOT / "state"
-VOLUME_MARKER = STATE_DIR / ".volume_ok"
+import state_paths
+
+ROOT = state_paths.ROOT
+# Resolved at call time via property-like helpers so METEORA_STATE_DIR works.
+
+
+def _state_dir() -> Path:
+    return state_paths.state_dir()
+
+
+STATE_DIR = state_paths.state_dir()  # import-time default; ensure_* re-resolves
+VOLUME_MARKER_NAME = ".volume_ok"
 
 # Docker anonymous volumes: 64 hex chars under /var/lib/docker/volumes/<id>/_data
 _ANON_VOLUME_ROOT = re.compile(
@@ -99,10 +108,12 @@ def ensure_state_dir(
     Outside a container the mount check is skipped (host run).
     Inside: classify /app/state via mountinfo. Marker is a second signal for wipe.
     """
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    marker_existed = VOLUME_MARKER.is_file()
+    state = _state_dir()
+    marker = state / VOLUME_MARKER_NAME
+    state.mkdir(parents=True, exist_ok=True)
+    marker_existed = marker.is_file()
     if not marker_existed:
-        VOLUME_MARKER.write_text(
+        marker.write_text(
             "meteora-lp-bot state volume marker — must survive container recreate\n",
             encoding="utf-8",
         )
