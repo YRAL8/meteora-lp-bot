@@ -65,6 +65,11 @@ REBALANCE_BLOCKED_REMINDER_HOURS = float(
     os.getenv("REBALANCE_BLOCKED_REMINDER_HOURS", "1")
 )
 
+# Periodic status heartbeat (hours). Same name/default as orca-lp-bot. 0 = off.
+HEARTBEAT_INTERVAL_HOURS = float(os.getenv("HEARTBEAT_INTERVAL_HOURS", "4"))
+if HEARTBEAT_INTERVAL_HOURS < 0:
+    raise ValueError("HEARTBEAT_INTERVAL_HOURS must be >= 0")
+
 MIN_SOL_BALANCE = float(os.getenv("MIN_SOL_BALANCE", "0.08"))
 
 # Opt-in when build-add returns >1 tx (C11b). Default off — one-tx adds work

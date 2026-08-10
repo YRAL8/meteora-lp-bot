@@ -30,6 +30,9 @@ SOLANA_DEVNET_RPC_URL=https://api.devnet.solana.com
 # Seconds between monitoring ticks.
 POLL_INTERVAL_SEC=300
 
+# Hours between heartbeat Telegram summaries (0 = disable). Same as orca-lp-bot.
+HEARTBEAT_INTERVAL_HOURS=4
+
 # --- Auto-rebalance (C4) ---
 # Default OFF. Flip to true only when you consciously want the bot to spend.
 AUTO_REBALANCE=false

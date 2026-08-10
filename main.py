@@ -93,6 +93,224 @@ def reset_storm_guards_for_tests() -> None:
     _uneconomic_warned_at = None
 
 
+# Last successfully read position snapshot for heartbeat (never shown as "current"
+# without an age mark when a later read fails — LITE_4 / orca audit 27 Jul).
+_last_good_position: Optional[dict] = None
+_last_good_position_at: Optional[datetime] = None
+_last_good_usdc_per_sol: Optional[float] = None
+_last_good_active_id: Optional[int] = None
+_last_good_bin_step: Optional[int] = None
+
+
+def reset_heartbeat_snapshot_for_tests() -> None:
+    global _last_good_position, _last_good_position_at
+    global _last_good_usdc_per_sol, _last_good_active_id, _last_good_bin_step
+    _last_good_position = None
+    _last_good_position_at = None
+    _last_good_usdc_per_sol = None
+    _last_good_active_id = None
+    _last_good_bin_step = None
+
+
+def _store_good_position_snapshot(
+    pos: dict,
+    *,
+    active_id: int,
+    usdc_per_sol: float,
+    bin_step: int,
+    now: datetime,
+) -> None:
+    global _last_good_position, _last_good_position_at
+    global _last_good_usdc_per_sol, _last_good_active_id, _last_good_bin_step
+    _last_good_position = dict(pos)
+    _last_good_position_at = now
+    _last_good_usdc_per_sol = float(usdc_per_sol)
+    _last_good_active_id = int(active_id)
+    _last_good_bin_step = int(bin_step)
+
+
+def _clear_good_position_snapshot() -> None:
+    global _last_good_position, _last_good_position_at
+    global _last_good_usdc_per_sol, _last_good_active_id, _last_good_bin_step
+    _last_good_position = None
+    _last_good_position_at = None
+    _last_good_usdc_per_sol = None
+    _last_good_active_id = None
+    _last_good_bin_step = None
+
+
+def _auto_stopped_reasons(*, now: datetime, usable_sol: Optional[float]) -> list[str]:
+    """Why automation is not acting — heartbeat always reports these (LITE_4)."""
+    reasons: list[str] = []
+    if bot_state.bot_paused:
+        reasons.append("владелец нажал /pauza")
+    if bot_state.bot_frozen:
+        reasons.append("владелец нажал /stop")
+    if not bot_config.AUTO_REBALANCE:
+        reasons.append("AUTO_REBALANCE выключен")
+    if is_reopen_pending():
+        reasons.append("reopen_pending (ребаланс оборван)")
+    try:
+        import meteora_exec
+
+        unresolved = meteora_exec.list_unresolved_journal()
+    except OSError:
+        unresolved = []
+    if unresolved:
+        reasons.append(f"журнал: {len(unresolved)} незакрытых подписей")
+    _ensure_rebalance_day(now)
+    if _rebalance_count_today >= bot_config.MAX_REBALANCES_PER_DAY:
+        reasons.append(
+            f"достигнут дневной предел ребалансов "
+            f"({_rebalance_count_today}/{bot_config.MAX_REBALANCES_PER_DAY})"
+        )
+    if usable_sol is not None and usable_sol < bot_config.MIN_SOL_BALANCE:
+        reasons.append(
+            f"мало SOL для авто (доступно {usable_sol:.4f} < "
+            f"{bot_config.MIN_SOL_BALANCE})"
+        )
+    return reasons
+
+
+def format_heartbeat(*, now: datetime | None = None) -> str:
+    """Build heartbeat text (same formatters as /status). Never silent when auto stopped."""
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    mode = "DEMO" if bot_config.DRY_RUN else "БОЕВОЙ"
+    net = bot_config.effective_network()
+    lines = [f"💓 <b>Сердцебиение [{mode}]</b> · {escape_html(net)}"]
+
+    usable_sol: Optional[float] = None
+    read_ok = False
+    pos: Optional[dict] = None
+    active_id = 0
+    bin_step = 1
+    usdc_per_sol = 0.0
+    sol_ui = 0.0
+    usdc_ui = 0.0
+
+    try:
+        owner = bot_config.wallet_pubkey()
+        kw = money_ops.ops_kwargs()
+        bal = meteora_ops.balances(owner, **kw)
+        pool = meteora_ops.pool_info(**kw)
+        pos = money_ops.get_primary_position()
+        read_ok = True
+        active_id = int(pool["activeId"])
+        bin_step = int(pool["binStep"])
+        usdc_per_sol = float(pool.get("usdcPerSol") or 0)
+        sol_ui = float((bal.get("sol") or {}).get("ui") or 0)
+        usdc_ui = float((bal.get("usdc") or {}).get("ui") or 0)
+        sao = bal.get("solAvailableForOpen")
+        if sao is not None:
+            usable_sol = max(0.0, float(sao))
+        else:
+            usable_sol = max(0.0, sol_ui - bot_config.MIN_SOL_BALANCE)
+        if pos is not None:
+            _store_good_position_snapshot(
+                pos,
+                active_id=active_id,
+                usdc_per_sol=usdc_per_sol,
+                bin_step=bin_step,
+                now=now,
+            )
+        else:
+            _clear_good_position_snapshot()
+    except Exception as exc:
+        log.warning("heartbeat: position/pool read failed: %s", exc, exc_info=True)
+        read_ok = False
+
+    if not read_ok:
+        lines.append(
+            "❌ <b>Позицию прочитать не удалось</b> (это не «всё в порядке»)."
+        )
+        if (
+            _last_good_position is not None
+            and _last_good_position_at is not None
+            and _last_good_usdc_per_sol is not None
+        ):
+            age_h = max(
+                0.0, (now - _last_good_position_at).total_seconds() / 3600.0
+            )
+            lines.append(
+                f"Последняя <b>удачная</b> позиция "
+                f"(≈{age_h:.1f} ч назад — <b>не текущая</b>):"
+            )
+            lines.append(
+                format_position_table(
+                    _last_good_position, _last_good_usdc_per_sol
+                )
+            )
+            if (
+                _last_good_active_id is not None
+                and _last_good_bin_step is not None
+            ):
+                lines.append(
+                    format_range_bar(
+                        int(_last_good_position["lowerBinId"]),
+                        int(_last_good_position["upperBinId"]),
+                        _last_good_active_id,
+                        _last_good_usdc_per_sol,
+                        _last_good_bin_step,
+                    )
+                )
+        else:
+            lines.append("Удачных чтений позиции в этом процессе ещё не было.")
+    elif pos is None:
+        trend = format_price_trend(usdc_per_sol, bot_config.POLL_INTERVAL_SEC)
+        lines.append("⏳ Открытых позиций нет.")
+        lines.append(f"📈 Цена SOL: ${usdc_per_sol:,.2f}{trend}")
+        lines.append(f"Кошелёк: {sol_ui:.4f} SOL · {usdc_ui:.2f} USDC")
+    else:
+        in_rng = position_in_range(pos, active_id)
+        status = "✅ в диапазоне" if in_rng else "⚠️ ВНЕ диапазона"
+        trend = format_price_trend(usdc_per_sol, bot_config.POLL_INTERVAL_SEC)
+        lines.append(format_position_table(pos, usdc_per_sol))
+        lines.append(f"📈 Цена SOL: ${usdc_per_sol:,.2f}{trend}")
+        lines.append(
+            format_range_bar(
+                int(pos["lowerBinId"]),
+                int(pos["upperBinId"]),
+                active_id,
+                usdc_per_sol,
+                bin_step,
+            )
+        )
+        lines.append(f"   Статус: {status}")
+        lines.append(f"Кошелёк: {sol_ui:.4f} SOL · {usdc_ui:.2f} USDC")
+
+    reasons = _auto_stopped_reasons(now=now, usable_sol=usable_sol)
+    if reasons:
+        lines.append("⏸ <b>Автоматика стоит:</b>")
+        for r in reasons:
+            lines.append(f"• {r}")
+    else:
+        lines.append("✅ Авто-ребаланс готов действовать при выходе из диапазона.")
+
+    return "\n".join(lines)
+
+
+async def heartbeat_loop(
+    *,
+    sleep_fn=asyncio.sleep,
+    now_fn=None,
+) -> None:
+    """Periodic heartbeat. First beat after one full interval (startup msg is separate)."""
+    interval_h = float(bot_config.HEARTBEAT_INTERVAL_HOURS)
+    if interval_h <= 0:
+        log.info("heartbeat disabled (HEARTBEAT_INTERVAL_HOURS=0)")
+        return
+    now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+    while True:
+        await sleep_fn(interval_h * 3600.0)
+        try:
+            send_telegram_message(format_heartbeat(now=now_fn()))
+        except Exception:
+            log.exception("heartbeat send failed — monitor continues")
+
+
 def median_cycle_hours(cycles: list) -> Optional[float]:
     vals = [
         float(c["duration_hours"])
@@ -312,9 +530,17 @@ async def monitor_position(*, now: datetime | None = None) -> None:
 
         pos = money_ops.get_primary_position()
         if pos is None:
+            _clear_good_position_snapshot()
             log.info("Мониторинг: позиций нет (activeId=%s)", active_id)
             return
 
+        _store_good_position_snapshot(
+            pos,
+            active_id=active_id,
+            usdc_per_sol=usdc_per_sol,
+            bin_step=bin_step,
+            now=now,
+        )
         in_rng = position_in_range(pos, active_id)
         lo_p, hi_p = _price_bounds(pos, active_id, usdc_per_sol, bin_step)
         trend = format_price_trend(usdc_per_sol, bot_config.POLL_INTERVAL_SEC)
@@ -783,6 +1009,9 @@ async def main() -> None:
             watchdog_task = asyncio.create_task(
                 _monitor_watchdog(), name="monitor-watchdog"
             )
+            heartbeat_task = asyncio.create_task(
+                heartbeat_loop(), name="heartbeat"
+            )
 
             def _on_monitor_done(task: asyncio.Task) -> None:
                 if task.cancelled():
@@ -809,21 +1038,19 @@ async def main() -> None:
             finally:
                 monitor_task.cancel()
                 watchdog_task.cancel()
-                try:
-                    await monitor_task
-                except asyncio.CancelledError:
-                    pass
-                try:
-                    await watchdog_task
-                except asyncio.CancelledError:
-                    pass
+                heartbeat_task.cancel()
+                for t in (monitor_task, watchdog_task, heartbeat_task):
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
                 await app.updater.stop()
                 await app.stop()
         return
 
-    log.warning("Telegram polling отключён — только мониторинг")
+    log.warning("Telegram polling отключён — только мониторинг + heartbeat")
     try:
-        await _monitor_loop()
+        await asyncio.gather(_monitor_loop(), heartbeat_loop())
     except (KeyboardInterrupt, SystemExit):
         log.info("Остановка по сигналу")
 

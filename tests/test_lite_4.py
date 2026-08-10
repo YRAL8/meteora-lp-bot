@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""LITE_4: heartbeat — silence must not look like health."""
+from __future__ import annotations
+
+import asyncio
+import sys
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+
+def _pos() -> dict:
+    return {
+        "pubkey": "PosHb111",
+        "lowerBinId": 100,
+        "upperBinId": 110,
+        "sol": 0.1,
+        "usdc": 5.0,
+        "fees": {"sol": 0, "usdc": 0},
+    }
+
+
+def _pool() -> dict:
+    return {
+        "activeId": 105,
+        "usdcPerSol": 140.0,
+        "binStep": 1,
+        "maxBinsPerPosition": 70,
+    }
+
+
+def _bal(*, sol: float = 1.0) -> dict:
+    return {
+        "sol": {"ui": sol},
+        "usdc": {"ui": 10.0},
+        "solAvailableForOpen": max(0.0, sol - 0.08),
+    }
+
+
+class HeartbeatIntervalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_interval_one_message_then_zero_when_disabled(self) -> None:
+        import bot_config
+        import main as main_mod
+
+        sent: list[str] = []
+        sleeps: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) >= 2:
+                raise asyncio.CancelledError()
+
+        with (
+            patch.object(bot_config, "HEARTBEAT_INTERVAL_HOURS", 4.0),
+            patch(
+                "main.send_telegram_message",
+                side_effect=lambda t: sent.append(t),
+            ),
+            patch(
+                "main.format_heartbeat",
+                return_value="💓 beat",
+            ),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await main_mod.heartbeat_loop(sleep_fn=fake_sleep)
+
+        self.assertEqual(sleeps[0], 4.0 * 3600.0)
+        self.assertEqual(len(sent), 1, "exactly one beat after first interval")
+
+        sent.clear()
+        sleeps.clear()
+        with patch.object(bot_config, "HEARTBEAT_INTERVAL_HOURS", 0.0):
+            await main_mod.heartbeat_loop(sleep_fn=fake_sleep)
+        self.assertEqual(sent, [])
+        self.assertEqual(sleeps, [])
+
+
+class HeartbeatStaleSnapshotTests(unittest.TestCase):
+    def test_read_failure_marks_last_good_as_not_current(self) -> None:
+        import bot_config
+        import bot_state
+        import main as main_mod
+
+        main_mod.reset_heartbeat_snapshot_for_tests()
+        main_mod.reset_storm_guards_for_tests()
+        bot_state.bot_paused = False
+        bot_state.bot_frozen = False
+        t0 = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+        main_mod._store_good_position_snapshot(
+            _pos(),
+            active_id=105,
+            usdc_per_sol=140.0,
+            bin_step=1,
+            now=t0,
+        )
+
+        with (
+            patch.object(bot_config, "AUTO_REBALANCE", True),
+            patch.object(bot_config, "DRY_RUN", True),
+            patch.object(bot_config, "effective_network", return_value="devnet"),
+            patch("main.bot_config.wallet_pubkey", return_value="Owner"),
+            patch("main.money_ops.ops_kwargs", return_value={}),
+            patch(
+                "main.meteora_ops.balances",
+                side_effect=RuntimeError("rpc down"),
+            ),
+            patch("main.is_reopen_pending", return_value=False),
+            patch("meteora_exec.list_unresolved_journal", return_value=[]),
+        ):
+            text = main_mod.format_heartbeat(now=t0 + timedelta(hours=3))
+
+        self.assertIn("прочитать не удалось", text.lower())
+        self.assertIn("не текущая", text.lower())
+        self.assertIn("≈3.0 ч", text)
+        # Old table numbers may appear only with the age disclaimer.
+        self.assertIn("Последняя", text)
+        self.assertIn("удачная", text)
+        self.assertIn("$19.00", text)  # from last-good table — only with age mark above
+
+
+class HeartbeatAutoStoppedTests(unittest.TestCase):
+    def test_reopen_pending_still_sends_with_reason(self) -> None:
+        import bot_config
+        import bot_state
+        import main as main_mod
+
+        main_mod.reset_heartbeat_snapshot_for_tests()
+        main_mod.reset_storm_guards_for_tests()
+        bot_state.bot_paused = False
+        bot_state.bot_frozen = False
+        now = datetime(2026, 8, 10, 15, 0, tzinfo=timezone.utc)
+
+        with (
+            patch.object(bot_config, "AUTO_REBALANCE", True),
+            patch.object(bot_config, "DRY_RUN", True),
+            patch.object(bot_config, "effective_network", return_value="devnet"),
+            patch("main.bot_config.wallet_pubkey", return_value="Owner"),
+            patch("main.money_ops.ops_kwargs", return_value={}),
+            patch("main.meteora_ops.balances", return_value=_bal()),
+            patch("main.meteora_ops.pool_info", return_value=_pool()),
+            patch("main.money_ops.get_primary_position", return_value=_pos()),
+            patch("main.is_reopen_pending", return_value=True),
+            patch("meteora_exec.list_unresolved_journal", return_value=[]),
+        ):
+            text = main_mod.format_heartbeat(now=now)
+
+        self.assertIn("Сердцебиение", text)
+        self.assertIn("Автоматика стоит", text)
+        self.assertIn("reopen_pending", text.lower())
+
+
+class HeartbeatDoesNotKillMonitorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_heartbeat_exception_monitor_continues(self) -> None:
+        import bot_config
+        import main as main_mod
+
+        sleeps = 0
+
+        async def one_sleep(_s: float) -> None:
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps >= 1:
+                raise asyncio.CancelledError()
+
+        with (
+            patch.object(bot_config, "HEARTBEAT_INTERVAL_HOURS", 1.0),
+            patch(
+                "main.format_heartbeat",
+                side_effect=RuntimeError("boom in heartbeat"),
+            ),
+            patch("main.send_telegram_message"),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await main_mod.heartbeat_loop(sleep_fn=one_sleep)
+
+        # Monitor tick still works after heartbeat path swallowed the error.
+        with (
+            patch("main.bot_state.bot_paused", False),
+            patch("main.bot_state.bot_frozen", False),
+            patch("main.is_reopen_pending", return_value=False),
+            patch("main._check_unresolved_journal", return_value=False),
+            patch("main.bot_config.wallet_pubkey", return_value="Owner"),
+            patch("main.money_ops.ops_kwargs", return_value={}),
+            patch("main.meteora_ops.pool_info", return_value=_pool()),
+            patch("main.money_ops.get_primary_position", return_value=None),
+            patch("main.send_telegram_message"),
+        ):
+            await main_mod.monitor_position(
+                now=datetime(2026, 8, 10, 16, 0, tzinfo=timezone.utc)
+            )
+        self.assertIsNotNone(main_mod._last_monitor_tick_at)
+
+
+if __name__ == "__main__":
+    unittest.main()
