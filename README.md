@@ -95,12 +95,13 @@ is not implemented here.
 
 ```bash
 cp env_template .env          # then fill in Telegram token, chat id, wallet path
-docker build -t meteora-lp-bot .
-docker run -d --name meteora-lp-bot --env-file .env \
-  -v /path/to/wallet.json:/home/appuser/.config/solana/wallet.json:ro \
-  -v meteora-lp-bot-state:/app/state \
-  meteora-lp-bot
+docker compose up -d --build
 ```
+
+In `.env` set `WALLET_HOST_PATH` to the absolute path of the Solana keypair JSON on
+the host (compose mounts it read-only into the container). Named volume
+`meteora-lp-bot-state` is declared in `docker-compose.yml` and always bound to
+`/app/state` — persistence does not depend on remembering a `-v` flag.
 
 Without Docker: `pip install -r requirements.txt`, build the TypeScript layer with
 `cd ts && npm install && npx tsc -p tsconfig.json`, then `python main.py`.

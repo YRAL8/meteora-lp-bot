@@ -1,0 +1,30 @@
+# Persistence of /app/state is a property of this file, not of the operator's memory.
+# Named volume meteora-lp-bot-state survives container recreate; do not rely on
+# ad-hoc `docker run -v …`.
+#
+# env_file: .env is safe HERE because this bot never rewrites .env at runtime —
+# mutable state lives under state/*.json, and bot_config only load_dotenv()s.
+# (In orca-lp-bot the same pattern was a landmine: the bot wrote POSITION_MINT
+# into .env on each rebalance, while env_file baked values into the container
+# env at create time and stale values won after restart. Do not "unify" that.)
+
+services:
+  meteora-lp-bot:
+    build: .
+    container_name: meteora-lp-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # In-container path of the read-only wallet mount (host path is WALLET_HOST_PATH).
+      WALLET_KEYPAIR_PATH: /home/appuser/.config/solana/wallet.json
+    volumes:
+      - meteora-lp-bot-state:/app/state
+      - ${WALLET_HOST_PATH}:/home/appuser/.config/solana/wallet.json:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  meteora-lp-bot-state:

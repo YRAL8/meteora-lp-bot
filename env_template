@@ -14,7 +14,12 @@ DRY_RUN=true
 
 # --- Wallet ---
 # Path to a Solana JSON keypair. Keep it outside the repository.
+# Without Docker (python main.py): used as-is.
 WALLET_KEYPAIR_PATH=~/.config/solana/meteora-devnet.json
+# With Docker Compose: absolute host path mounted read-only into the container
+# (see docker-compose.yml). Compose also sets WALLET_KEYPAIR_PATH inside the
+# container to the mount target — you only need WALLET_HOST_PATH for compose.
+WALLET_HOST_PATH=/absolute/path/to/your/wallet.json
 
 # --- Pool and RPC ---
 # Default pool is SOL-USDC on mainnet; override for devnet rehearsals.
