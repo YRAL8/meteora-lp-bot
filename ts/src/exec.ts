@@ -139,6 +139,19 @@ function awaitJournalHandshake(signature: string): Promise<boolean> {
       process.stdin.removeListener("data", onData);
       process.stdin.removeListener("end", onEnd);
       process.stdin.removeListener("error", onEnd);
+      // resume() to read the ack leaves stdin holding the event loop open, so a
+      // finished run would never exit: the devnet stand failed 5/5 on a 300s
+      // parent timeout while every transaction had already confirmed. pause()
+      // alone is enough (measured on a real parent-held pipe); unref() is kept
+      // as belt and braces, with ref() restored before the next wait.
+      try {
+        process.stdin.pause();
+        if (typeof process.stdin.unref === "function") {
+          process.stdin.unref();
+        }
+      } catch {
+        /* ignore */
+      }
       resolve(ok);
     };
     const timer = setTimeout(() => finish(false), timeoutMs);
@@ -158,6 +171,13 @@ function awaitJournalHandshake(signature: string): Promise<boolean> {
     process.stdin.on("data", onData);
     process.stdin.on("end", onEnd);
     process.stdin.on("error", onEnd);
+    try {
+      if (typeof process.stdin.ref === "function") {
+        process.stdin.ref();
+      }
+    } catch {
+      /* ignore */
+    }
     if (process.stdin.isPaused()) process.stdin.resume();
   });
 }
@@ -531,8 +551,32 @@ async function sendBuildResult(
   };
 }
 
+async function runHandshakeSelfTest(flags: Record<string, string | boolean>): Promise<void> {
+  /** Offline lifecycle probe: one journal handshake, no network/wallet/send. */
+  const signature = flagStr(flags, "signature");
+  if (!signature) {
+    fail("handshake-self-test", "missing --signature", "parseArgs");
+  }
+  emitJournalSending(0, signature, "open");
+  const journalOk = await awaitJournalHandshake(signature);
+  process.stdout.write(
+    JSON.stringify({
+      ok: journalOk,
+      action: "handshake-self-test",
+      signature,
+      journalOk,
+    }) + "\n"
+  );
+  // Natural return — must not process.exit(); hanging stdin would hide here.
+}
+
 async function main(): Promise<void> {
   const { cmd, flags } = parseArgs(process.argv.slice(2));
+
+  if (cmd === "handshake-self-test") {
+    await runHandshakeSelfTest(flags);
+    return;
+  }
 
   if (!isExecCommand(cmd)) {
     fail(cmd, `unknown command: ${cmd}`, "parseArgs");
