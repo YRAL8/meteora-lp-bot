@@ -34,7 +34,7 @@ def _fingerprint_dir(path: Path) -> dict[str, str]:
 
 def main() -> int:
     # Redirect ALL bot state writes to a temp dir (C12). Must be set before any
-    # test module imports auto_rebalance_limits / cycle_journal / etc.
+    # test module imports cycle_journal / reopen_pending / etc.
     td = tempfile.mkdtemp(prefix="meteora-test-state-")
     os.environ["METEORA_STATE_DIR"] = td
     Path(td).mkdir(parents=True, exist_ok=True)

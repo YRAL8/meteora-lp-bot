@@ -43,7 +43,6 @@ def s01_up_empty_wallet() -> ScenarioResult:
     import main as main_mod
     import money_ops
     import bot_config
-    import auto_rebalance_limits as ar_limits
     from reopen_pending import is_reopen_pending, set_reopen_pending
 
     expected = (
@@ -65,9 +64,7 @@ def s01_up_empty_wallet() -> ScenarioResult:
         t0 = datetime.now(timezone.utc)
         main_mod.out_of_range_since = t0 - timedelta(minutes=60)
         main_mod.last_auto_attempt_at = None
-        lim = ar_limits.load_state(now=t0)
-        lim.count_today = 0
-        ar_limits.save_state(lim)
+        main_mod.reset_storm_guards_for_tests()
 
         replies: list[str] = []
 
@@ -137,7 +134,6 @@ def s02_down_exit() -> ScenarioResult:
     import main as main_mod
     import money_ops
     import bot_config
-    import auto_rebalance_limits as ar_limits
     from reopen_pending import is_reopen_pending, set_reopen_pending
 
     expected = "auto-rebalance runs; SOL→USDC swap if needed; in-range position"
@@ -151,9 +147,7 @@ def s02_down_exit() -> ScenarioResult:
         t0 = datetime.now(timezone.utc)
         main_mod.out_of_range_since = t0 - timedelta(minutes=60)
         main_mod.last_auto_attempt_at = None
-        lim = ar_limits.load_state(now=t0)
-        lim.count_today = 0
-        ar_limits.save_state(lim)
+        main_mod.reset_storm_guards_for_tests()
         replies: list[str] = []
 
         async def _tick() -> None:

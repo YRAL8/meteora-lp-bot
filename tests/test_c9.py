@@ -6,7 +6,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -184,8 +184,6 @@ class TimerKeptOnFailure(unittest.IsolatedAsyncioTestCase):
             bot_state.money_lock.release()
 
     async def test_failed_auto_keeps_out_of_range_and_pauses(self) -> None:
-        import auto_rebalance_limits as ar_limits
-
         t0 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
         pos = {
             "pubkey": "P",
@@ -204,7 +202,7 @@ class TimerKeptOnFailure(unittest.IsolatedAsyncioTestCase):
         since = t0 - timedelta(minutes=30)
         main_mod.out_of_range_since = since
         main_mod.last_auto_attempt_at = None
-        lim = ar_limits.AutoRebalanceState(day_utc="2026-07-29", count_today=0)
+        main_mod.reset_storm_guards_for_tests()
         with (
             patch.object(bot_config, "AUTO_REBALANCE", True),
             patch.object(bot_config, "REBALANCE_DELAY_MIN", 20),
@@ -223,8 +221,6 @@ class TimerKeptOnFailure(unittest.IsolatedAsyncioTestCase):
                     "solAvailableForOpen": 0.9,
                 },
             ),
-            patch("main.ar_limits.load_state", return_value=lim),
-            patch("main.ar_limits.minutes_since_last", return_value=None),
             patch("main.money_ops.rebalance_position", return_value=None),
             patch("main.send_telegram_message"),
             patch("main.bot_config.wallet_pubkey", return_value="W"),
@@ -253,8 +249,6 @@ class TimerKeptOnFailure(unittest.IsolatedAsyncioTestCase):
                     "solAvailableForOpen": 0.9,
                 },
             ),
-            patch("main.ar_limits.load_state", return_value=lim),
-            patch("main.ar_limits.minutes_since_last", return_value=None),
             patch("main.money_ops.rebalance_position") as reb,
             patch("main.send_telegram_message"),
             patch("main.bot_config.wallet_pubkey", return_value="W"),
@@ -273,6 +267,7 @@ class SolGateUsesAvailable(unittest.IsolatedAsyncioTestCase):
         t0 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
         main_mod.out_of_range_since = t0 - timedelta(minutes=30)
         main_mod.last_auto_attempt_at = None
+        main_mod.reset_storm_guards_for_tests()
         pos = {
             "pubkey": "P",
             "lowerBinId": 1,
@@ -310,26 +305,21 @@ class SolGateUsesAvailable(unittest.IsolatedAsyncioTestCase):
                 "main.money_ops.suggest_for_budget",
                 return_value={"needSol": 0.05, "needUsdc": 5.0},
             ),
-            patch("main.ar_limits.load_state") as ls,
             patch("main.money_ops.rebalance_position", return_value={"ok": True}) as reb,
             patch("main.send_telegram_message"),
             patch("main.bot_config.wallet_pubkey", return_value="W"),
             patch("main._maybe_warn_uneconomic"),
-            patch("main.ar_limits.record_rebalance"),
+            patch("main._record_rebalance"),
         ):
-            lim = MagicMock()
-            lim.count_today = 0
-            lim.day_utc = "2026-07-29"
-            lim.ensure_day = MagicMock()
-            ls.return_value = lim
-            with patch("main.ar_limits.minutes_since_last", return_value=None):
-                await main_mod.monitor_position(now=t0)
+            main_mod.reset_storm_guards_for_tests()
+            await main_mod.monitor_position(now=t0)
             reb.assert_called_once()
 
     async def test_truly_short_budget_blocks(self) -> None:
         t0 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
         main_mod.out_of_range_since = t0 - timedelta(minutes=30)
         main_mod.last_auto_attempt_at = None
+        main_mod.reset_storm_guards_for_tests()
         pos = {
             "pubkey": "P",
             "lowerBinId": 1,
@@ -367,18 +357,11 @@ class SolGateUsesAvailable(unittest.IsolatedAsyncioTestCase):
                 "main.money_ops.suggest_for_budget",
                 return_value={"needSol": 0.05, "needUsdc": 5.0},
             ),
-            patch("main.ar_limits.load_state") as ls,
             patch("main.money_ops.rebalance_position") as reb,
             patch("main.send_telegram_message") as tg,
             patch("main.bot_config.wallet_pubkey", return_value="W"),
         ):
-            lim = MagicMock()
-            lim.count_today = 0
-            lim.day_utc = "2026-07-29"
-            lim.ensure_day = MagicMock()
-            ls.return_value = lim
-            with patch("main.ar_limits.minutes_since_last", return_value=None):
-                await main_mod.monitor_position(now=t0)
+            await main_mod.monitor_position(now=t0)
             reb.assert_not_called()
             texts = " ".join(str(c.args[0]) for c in tg.call_args_list)
             self.assertTrue("своп" in texts.lower() or "бюджет" in texts.lower() or "SOL" in texts)

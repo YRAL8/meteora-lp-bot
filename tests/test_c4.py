@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,7 +11,6 @@ from unittest.mock import MagicMock, patch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import auto_rebalance_limits as ar_limits  # noqa: E402
 import bot_config  # noqa: E402
 import bot_state  # noqa: E402
 import main as main_mod  # noqa: E402
@@ -45,12 +43,10 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
         main_mod.out_of_range_since = None
         main_mod.last_auto_attempt_at = None
         main_mod._reset_rebalance_blocked_state()
+        main_mod.reset_storm_guards_for_tests()
         bot_state.bot_paused = False
         bot_state.bot_frozen = False
-        self.tmp = tempfile.TemporaryDirectory()
-        self.state_path = Path(self.tmp.name) / "auto_rebalance.json"
         self.patches = [
-            patch.object(ar_limits, "STATE_PATH", self.state_path),
             patch.object(bot_config, "AUTO_REBALANCE", True),
             patch.object(bot_config, "REBALANCE_DELAY_MIN", 20),
             patch.object(bot_config, "MIN_REBALANCE_INTERVAL_MIN", 60),
@@ -71,10 +67,10 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         for p in reversed(self.patches):
             p.stop()
-        self.tmp.cleanup()
         main_mod.out_of_range_since = None
         main_mod.last_auto_attempt_at = None
         main_mod._reset_rebalance_blocked_state()
+        main_mod.reset_storm_guards_for_tests()
 
     async def test_delay_prevents_immediate_rebalance(self) -> None:
         t0 = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
@@ -124,12 +120,9 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_min_interval_blocks_second(self) -> None:
         t0 = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
-        st = ar_limits.AutoRebalanceState(day_utc="2026-07-29", count_today=1)
-        ar_limits.record_rebalance(st, t0)  # sets last_rebalance_at=t0, count=2
-        # Reset count for clarity — we care about interval
-        st = ar_limits.load_state(now=t0)
-        st.count_today = 1
-        ar_limits.save_state(st)
+        main_mod._last_rebalance_at = t0
+        main_mod._rebalance_day_utc = "2026-07-29"
+        main_mod._rebalance_count_today = 1
 
         main_mod.out_of_range_since = t0 - timedelta(minutes=30)
         with patch("main.meteora_ops.pool_info", return_value=_pool(active=200)):
@@ -149,10 +142,10 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
     async def test_daily_cap_stops_and_notifies(self) -> None:
         t0 = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
         patch.object(bot_config, "MAX_REBALANCES_PER_DAY", 1).start()
-        st = ar_limits.AutoRebalanceState(day_utc="2026-07-29", count_today=1)
-        # last rebalance long ago so interval OK
-        st.last_rebalance_at = (t0 - timedelta(hours=3)).isoformat().replace("+00:00", "Z")
-        ar_limits.save_state(st)
+        main_mod._rebalance_day_utc = "2026-07-29"
+        main_mod._rebalance_count_today = 1
+        main_mod._last_rebalance_at = t0 - timedelta(hours=3)
+        main_mod._daily_limit_notified_day = None
 
         main_mod.out_of_range_since = t0 - timedelta(minutes=30)
         with patch("main.meteora_ops.pool_info", return_value=_pool(active=200)):
@@ -171,6 +164,10 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
                             reb.assert_not_called()
                             texts = " ".join(str(c.args[0]) for c in tg.call_args_list)
                             self.assertIn("Лимит", texts)
+                            # Second tick same day — no second notify
+                            n1 = tg.call_count
+                            await main_mod.monitor_position(now=t0 + timedelta(minutes=1))
+                            self.assertEqual(tg.call_count, n1)
 
     async def test_uneconomic_warns_but_still_rebalances(self) -> None:
         t0 = datetime(2026, 7, 29, 15, 0, tzinfo=timezone.utc)
@@ -238,7 +235,7 @@ class AutoRebalanceMonitorTests(unittest.IsolatedAsyncioTestCase):
 class MedianHoursTests(unittest.TestCase):
     def test_median(self) -> None:
         self.assertEqual(
-            ar_limits.median_cycle_hours(
+            main_mod.median_cycle_hours(
                 [{"duration_hours": 1}, {"duration_hours": 3}, {"duration_hours": 2}]
             ),
             2.0,

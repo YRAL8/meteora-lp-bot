@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
-import auto_rebalance_limits as ar_limits
 import bot_config
 import bot_state
 import meteora_cycle_journal as cycle_journal
@@ -13,7 +12,7 @@ import meteora_ops
 import money_ops
 import monitor_timer_state
 import range_state
-import state_volume
+import state_paths
 import telegram_commands as tg
 import telegram_notify
 from reopen_pending import is_reopen_pending, load_reopen_pending
@@ -38,6 +37,76 @@ rebalance_blocked_alert_sent = False
 rebalance_blocked_last_alert_at: Optional[datetime] = None
 _last_monitor_tick_at: Optional[datetime] = None
 _monitor_watchdog_alerted = False
+
+# Storm guards — process memory only (LITE_2). Reset on bot restart is intentional.
+_last_rebalance_at: Optional[datetime] = None
+_rebalance_day_utc: str = ""
+_rebalance_count_today: int = 0
+_daily_limit_notified_day: Optional[str] = None
+_uneconomic_warned_at: Optional[datetime] = None
+
+
+def _utc_day_key(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _ensure_rebalance_day(now: datetime) -> None:
+    global _rebalance_day_utc, _rebalance_count_today
+    key = _utc_day_key(now)
+    if _rebalance_day_utc != key:
+        _rebalance_day_utc = key
+        _rebalance_count_today = 0
+
+
+def _minutes_since_last_rebalance(now: datetime) -> Optional[float]:
+    if _last_rebalance_at is None:
+        return None
+    last = _last_rebalance_at
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (now - last).total_seconds() / 60.0
+
+
+def _record_rebalance(now: datetime) -> None:
+    global _last_rebalance_at, _rebalance_count_today
+    _ensure_rebalance_day(now)
+    _rebalance_count_today += 1
+    _last_rebalance_at = now
+
+
+def _mark_daily_limit_notified(now: datetime) -> None:
+    global _daily_limit_notified_day
+    _ensure_rebalance_day(now)
+    _daily_limit_notified_day = _rebalance_day_utc
+
+
+def reset_storm_guards_for_tests() -> None:
+    """Clear in-memory storm counters (offline tests / scenario setup)."""
+    global _last_rebalance_at, _rebalance_day_utc, _rebalance_count_today
+    global _daily_limit_notified_day, _uneconomic_warned_at
+    _last_rebalance_at = None
+    _rebalance_day_utc = ""
+    _rebalance_count_today = 0
+    _daily_limit_notified_day = None
+    _uneconomic_warned_at = None
+
+
+def median_cycle_hours(cycles: list) -> Optional[float]:
+    vals = [
+        float(c["duration_hours"])
+        for c in cycles
+        if c.get("duration_hours") is not None and not c.get("incomplete")
+    ]
+    if not vals:
+        return None
+    vals.sort()
+    n = len(vals)
+    mid = n // 2
+    if n % 2:
+        return vals[mid]
+    return (vals[mid - 1] + vals[mid]) / 2.0
 
 
 def _format_unresolved_journal_alert(
@@ -148,20 +217,21 @@ def _price_bounds(
 
 def _maybe_warn_uneconomic(pos: dict, usdc_per_sol: float) -> None:
     """Warn when median cycle life < payback; never blocks the rebalance."""
+    global _uneconomic_warned_at
     lookback = bot_config.UNECONOMIC_LOOKBACK_CYCLES
     cycles = cycle_journal.get_default_journal().read_recent_cycles(limit=lookback)
-    median = ar_limits.median_cycle_hours(cycles)
+    median = median_cycle_hours(cycles)
     if median is None:
         return
     pos_usd = money_ops.position_value_usd(pos, usdc_per_sol)
     payback = bot_config.effective_payback_hours(pos_usd)
     if median >= payback:
         return
-    st = ar_limits.load_state(now=datetime.now(timezone.utc))
-    if not ar_limits.should_warn_uneconomic(
-        st, reminder_hours=bot_config.REBALANCE_BLOCKED_REMINDER_HOURS
-    ):
-        return
+    now = datetime.now(timezone.utc)
+    if _uneconomic_warned_at is not None:
+        hours = (now - _uneconomic_warned_at).total_seconds() / 3600.0
+        if hours < bot_config.REBALANCE_BLOCKED_REMINDER_HOURS:
+            return
     pct = range_state.current_range_pct()
     msg = (
         f"⚠️ <b>Диагностика окупаемости</b> (не блокирует ребаланс)\n"
@@ -179,7 +249,7 @@ def _maybe_warn_uneconomic(pos: dict, usdc_per_sol: float) -> None:
         payback,
         pos_usd,
     )
-    ar_limits.mark_uneconomic_warned(st)
+    _uneconomic_warned_at = now
 
 
 def _tg_reply_collector(buf: list[str]):
@@ -372,10 +442,9 @@ async def monitor_position(*, now: datetime | None = None) -> None:
             )
             return
 
-        # Storm guard: min interval
-        lim = ar_limits.load_state(now=now)
-        lim.ensure_day(now)
-        since_last = ar_limits.minutes_since_last(lim, now)
+        # Storm guard: min interval (in-memory)
+        _ensure_rebalance_day(now)
+        since_last = _minutes_since_last_rebalance(now)
         if (
             since_last is not None
             and since_last < bot_config.MIN_REBALANCE_INTERVAL_MIN
@@ -387,19 +456,19 @@ async def monitor_position(*, now: datetime | None = None) -> None:
             )
             return
 
-        # Storm guard: daily cap
-        if lim.count_today >= bot_config.MAX_REBALANCES_PER_DAY:
-            if lim.daily_limit_notified_day != lim.day_utc:
+        # Storm guard: daily cap (in-memory; one Telegram notice per UTC day)
+        if _rebalance_count_today >= bot_config.MAX_REBALANCES_PER_DAY:
+            if _daily_limit_notified_day != _rebalance_day_utc:
                 send_telegram_message(
                     f"🛑 <b>Лимит авто-ребалансов на сутки исчерпан</b>\n"
-                    f"Сегодня уже {lim.count_today} "
+                    f"Сегодня уже {_rebalance_count_today} "
                     f"(MAX_REBALANCES_PER_DAY={bot_config.MAX_REBALANCES_PER_DAY}).\n"
                     f"Автоматика приостановлена до конца суток UTC.\n"
                     f"Варианты: расширить диапазон (/setrange), сменить пул, "
                     f"или осознанно поднять MAX_REBALANCES_PER_DAY.\n"
                     f"Ручной /rebalance по-прежнему доступен."
                 )
-                ar_limits.mark_daily_limit_notified(lim, now)
+                _mark_daily_limit_notified(now)
                 log.warning("MAX_REBALANCES_PER_DAY reached — auto paused for today")
             return
 
@@ -553,7 +622,7 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                 out_of_range_since = None
                 last_auto_attempt_at = None
                 _persist_timers()
-                ar_limits.record_rebalance(lim, now)
+                _record_rebalance(now)
                 _reset_rebalance_blocked_state()
                 send_telegram_message("✅ Авто-ребаланс завершён.")
             except SystemExit:
@@ -574,7 +643,7 @@ async def main() -> None:
     global out_of_range_since, last_auto_attempt_at
 
     _assert_mainnet_rpc_explicit()
-    persistent, state_line = state_volume.ensure_state_dir()
+    state_paths.state_dir().mkdir(parents=True, exist_ok=True)
     out_of_range_since, last_auto_attempt_at = monitor_timer_state.load_timers()
 
     rpc_url = bot_config.effective_rpc()
@@ -593,7 +662,6 @@ async def main() -> None:
         bot_config.pool_pubkey(),
         rpc_host,
     )
-    log.info("state: %s", state_line)
     if out_of_range_since or last_auto_attempt_at:
         log.info(
             "restored timers out_of_range_since=%s last_auto_attempt_at=%s",
@@ -601,22 +669,6 @@ async def main() -> None:
             last_auto_attempt_at,
         )
     log.info("=" * 50)
-
-    # Live mainnet without a real state mount must not start (C12).
-    if (
-        not persistent
-        and bot_config.effective_network() == "mainnet"
-        and not bot_config.DRY_RUN
-    ):
-        msg = (
-            "🛑 <b>Старт запрещён: нет нормального тома /app/state на mainnet</b>\n"
-            f"{escape_html(state_line)}\n"
-            "Без тома пропадут reopen_pending, журнал и штормовые счётчики. "
-            "Смонтируй -v …:/app/state и перезапусти."
-        )
-        log.error("refusing mainnet start without persistent state: %s", state_line)
-        send_telegram_message(msg)
-        raise SystemExit(2)
 
     if is_reopen_pending():
         meta = load_reopen_pending() or {}
@@ -700,17 +752,10 @@ async def main() -> None:
         if bot_config.AUTO_REBALANCE
         else "только наблюдение (AUTO_REBALANCE=off)"
     )
-    state_warn = (
-        ""
-        if persistent
-        else "\n⚠️ Без нормального тома на /app/state состояние пропадёт при recreate"
-    )
     send_telegram_message(
         f"🤖 <b>Meteora LP-бот запущен</b>\n"
         f"Режим: {mode} · сеть: {bot_config.effective_network()}\n"
         f"RPC: <code>{escape_html(rpc_host)}</code>\n"
-        f"Состояние: {escape_html(state_line)}"
-        f"{state_warn}\n"
         f"{auto_line} · выдержка {bot_config.REBALANCE_DELAY_MIN} мин\n"
         f"Пул: <code>{bot_config.pool_pubkey()}</code>\n"
         f"Опрос: {bot_config.POLL_INTERVAL_SEC} сек\n"

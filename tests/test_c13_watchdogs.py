@@ -141,24 +141,15 @@ class ResolveJournalDeadRpcTests(unittest.TestCase):
             self.assertGreaterEqual(len(still), 1)
 
 
-class DockerVolumeGateDocTests(unittest.TestCase):
-    """Live docker proof is in scenarios/docker_volume_gate.sh — here only gate logic."""
+class StateDirStartupTests(unittest.TestCase):
+    """LITE_2: volume gate removed; startup only mkdir state dir."""
 
-    def test_mainnet_refuses_without_persistent(self) -> None:
+    def test_main_has_no_state_volume_import(self) -> None:
         import main as main_mod
-        import bot_config
 
-        # Pure condition check as used in main()
-        persistent = False
-        dry = False
-        with patch.object(bot_config, "effective_network", return_value="mainnet"):
-            with patch.object(bot_config, "DRY_RUN", False):
-                should_exit = (
-                    not persistent
-                    and bot_config.effective_network() == "mainnet"
-                    and not bot_config.DRY_RUN
-                )
-        self.assertTrue(should_exit)
+        src = Path(main_mod.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("state_volume", src)
+        self.assertIn("state_paths.state_dir().mkdir", src)
 
 
 if __name__ == "__main__":

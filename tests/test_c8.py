@@ -12,7 +12,6 @@ from unittest.mock import MagicMock, patch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import auto_rebalance_limits as ar_limits  # noqa: E402
 import bot_config  # noqa: E402
 import bot_state  # noqa: E402
 import main as main_mod  # noqa: E402
@@ -27,12 +26,14 @@ class FakeAutoSuccess(unittest.IsolatedAsyncioTestCase):
         set_reopen_pending(False)
         main_mod.out_of_range_since = None
         main_mod.last_auto_attempt_at = None
+        main_mod.reset_storm_guards_for_tests()
         bot_state.bot_paused = False
         bot_state.bot_frozen = False
 
     async def asyncTearDown(self) -> None:
         set_reopen_pending(False)
         main_mod.last_auto_attempt_at = None
+        main_mod.reset_storm_guards_for_tests()
         if bot_state.money_lock.locked():
             bot_state.money_lock.release()
         bot_state.bot_frozen = False
@@ -56,7 +57,6 @@ class FakeAutoSuccess(unittest.IsolatedAsyncioTestCase):
             "maxBinsPerPosition": 70,
         }
         sent: list[str] = []
-        lim = ar_limits.AutoRebalanceState(day_utc="2099-01-01", count_today=0)
 
         with (
             patch.object(bot_config, "AUTO_REBALANCE", True),
@@ -76,8 +76,7 @@ class FakeAutoSuccess(unittest.IsolatedAsyncioTestCase):
                     "solAvailableForOpen": 0.9,
                 },
             ),
-            patch("main.ar_limits.load_state", return_value=lim),
-            patch("main.ar_limits.record_rebalance") as rec,
+            patch("main._record_rebalance") as rec,
             patch("main.money_ops.rebalance_position", return_value=None),
             patch("main.send_telegram_message", side_effect=lambda t: sent.append(t)),
             patch("main.bot_config.wallet_pubkey", return_value="W"),

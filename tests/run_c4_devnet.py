@@ -30,7 +30,6 @@ import money_ops  # noqa: E402
 import meteora_exec  # noqa: E402
 import meteora_ops  # noqa: E402
 import range_state  # noqa: E402
-import auto_rebalance_limits as ar_limits  # noqa: E402
 from reopen_pending import is_reopen_pending, set_reopen_pending  # noqa: E402
 
 
@@ -141,8 +140,10 @@ async def run_auto_chain() -> None:
         active = int(pool["activeId"])
         in_rng = int(pos["lowerBinId"]) <= active <= int(pos["upperBinId"])
         _log(f"new bins=[{pos['lowerBinId']},{pos['upperBinId']}] active={active} in_range={in_rng}")
-    lim = ar_limits.load_state()
-    _log(f"limit state count_today={lim.count_today} last={lim.last_rebalance_at}")
+    _log(
+        f"limit state count_today={main_mod._rebalance_count_today} "
+        f"last={main_mod._last_rebalance_at}"
+    )
 
 
 async def run_daily_cap_refusal() -> None:
@@ -154,12 +155,11 @@ async def run_daily_cap_refusal() -> None:
 
     # Seed: already used today's one slot; last rebalance long ago.
     now = datetime.now(timezone.utc)
-    st = ar_limits.load_state()
-    st.day_utc = now.strftime("%Y-%m-%d")
-    st.count_today = 1
-    st.last_rebalance_at = (now - timedelta(hours=5)).isoformat().replace("+00:00", "Z")
-    st.daily_limit_notified_day = None
-    ar_limits.save_state(st)
+    main_mod.reset_storm_guards_for_tests()
+    main_mod._rebalance_day_utc = now.strftime("%Y-%m-%d")
+    main_mod._rebalance_count_today = 1
+    main_mod._last_rebalance_at = now - timedelta(hours=5)
+    main_mod._daily_limit_notified_day = None
 
     # Ensure we have an OOR position (re-open offset if previous reopen put us in range)
     pos = money_ops.get_primary_position()
@@ -175,13 +175,15 @@ async def run_daily_cap_refusal() -> None:
     t0 = datetime.now(timezone.utc)
     await main_mod.monitor_position(now=t0)
     await main_mod.monitor_position(now=t0 + timedelta(seconds=5))
-    lim = ar_limits.load_state()
     _log(
-        f"after cap ticks: count={lim.count_today} notified_day={lim.daily_limit_notified_day} "
+        f"after cap ticks: count={main_mod._rebalance_count_today} "
+        f"notified_day={main_mod._daily_limit_notified_day} "
         f"pending={is_reopen_pending()}"
     )
-    assert lim.daily_limit_notified_day == lim.day_utc, "expected daily-limit Telegram mark"
-    assert lim.count_today == 1, "cap must not increment when blocked"
+    assert (
+        main_mod._daily_limit_notified_day == main_mod._rebalance_day_utc
+    ), "expected daily-limit Telegram mark"
+    assert main_mod._rebalance_count_today == 1, "cap must not increment when blocked"
 
 
 async def main() -> None:

@@ -21,27 +21,21 @@ class StateDirRedirectTests(unittest.TestCase):
             with patch.dict(os.environ, {"METEORA_STATE_DIR": td}):
                 self.assertEqual(state_paths.state_dir(), Path(td))
                 self.assertEqual(
-                    state_paths.path("auto_rebalance.json"),
-                    Path(td) / "auto_rebalance.json",
+                    state_paths.path("reopen_pending.json"),
+                    Path(td) / "reopen_pending.json",
                 )
 
     def test_writes_go_to_override_not_repo_state(self) -> None:
-        import auto_rebalance_limits as ar_limits
         import reopen_pending
 
-        real = ROOT / "state" / "auto_rebalance.json"
+        real = ROOT / "state" / "reopen_pending.json"
         before = real.read_bytes() if real.is_file() else None
         with tempfile.TemporaryDirectory() as td:
-            with patch.object(ar_limits, "STATE_PATH", Path(td) / "auto_rebalance.json"):
+            with patch.dict(os.environ, {"METEORA_STATE_DIR": td}):
                 with patch.object(
                     reopen_pending, "REOPEN_PENDING_PATH", Path(td) / "reopen_pending.json"
                 ):
-                    st = ar_limits.AutoRebalanceState(
-                        day_utc="2099-01-01", count_today=0
-                    )
-                    ar_limits.save_state(st)
                     reopen_pending.set_reopen_pending(True, meta={"t": 1})
-                    self.assertTrue((Path(td) / "auto_rebalance.json").is_file())
                     self.assertTrue((Path(td) / "reopen_pending.json").is_file())
         after = real.read_bytes() if real.is_file() else None
         self.assertEqual(before, after)
