@@ -88,10 +88,10 @@ class ResolveJournalDeadRpcTests(unittest.TestCase):
         src = inspect.getsource(meteora_exec.resolve_journal)
         self.assertIn("25_000", src)
         self.assertIn("180.0", src)
-        # TS wall must be below Python subprocess ceiling.
-        text = (ROOT / "ts" / "src" / "exec.ts").read_text(encoding="utf-8")
-        self.assertIn("170000", text)
-        self.assertIn("25000", text)
+        # Wall budget lives in Python (LITE_1); must stay under timeout_s ceiling.
+        self.assertEqual(meteora_exec.RESOLVE_WALL_MS, 170_000)
+        self.assertEqual(meteora_exec.RESOLVE_PER_SIG_TIMEOUT_MS, 25_000)
+        self.assertLess(meteora_exec.RESOLVE_WALL_MS / 1000.0, 180.0)
 
     def test_resolve_with_dead_rpc_returns_or_times_out_cleanly(self) -> None:
         import json

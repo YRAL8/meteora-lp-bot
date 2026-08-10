@@ -63,18 +63,24 @@ class JournalDoorGuardTests(unittest.TestCase):
             "exec_journal.jsonl outside door modules: " + ", ".join(offenders),
         )
 
-    def test_ts_basenames_only_in_journal_ts(self) -> None:
+    def test_ts_has_no_journal_basenames(self) -> None:
+        """LITE_1: TypeScript must not name the journal or lock files."""
         offenders: list[str] = []
-        for path in (ROOT / "ts" / "src").glob("*.ts"):
-            if path.name in {"journal.ts", "test_logic.ts"}:
-                continue
+        src = ROOT / "ts" / "src"
+        if not src.is_dir():
+            return
+        for path in src.glob("*.ts"):
             text = path.read_text(encoding="utf-8", errors="replace")
             if "exec_journal.jsonl" in text or "exec_journal.lock" in text:
                 offenders.append(path.name)
         self.assertEqual(
             offenders,
             [],
-            "TS journal basenames outside journal.ts: " + ", ".join(offenders),
+            "TS must not reference journal basenames: " + ", ".join(offenders),
+        )
+        self.assertFalse(
+            (src / "journal.ts").is_file(),
+            "ts/src/journal.ts must be deleted (Python owns the journal)",
         )
 
     def test_python_door_lock_basename(self) -> None:
@@ -83,12 +89,6 @@ class JournalDoorGuardTests(unittest.TestCase):
         self.assertEqual(exec_journal_io.LOCK_BASENAME, "exec_journal.lock")
         self.assertEqual(exec_journal_io.JOURNAL_BASENAME, "exec_journal.jsonl")
         self.assertEqual(exec_journal_io.lock_path().name, "exec_journal.lock")
-
-    def test_journal_ts_exports_matching_basenames(self) -> None:
-        text = (ROOT / "ts" / "src" / "journal.ts").read_text(encoding="utf-8")
-        self.assertIn('LOCK_BASENAME = "exec_journal.lock"', text)
-        self.assertIn('JOURNAL_BASENAME = "exec_journal.jsonl"', text)
-        self.assertNotIn(".jsonl.lock", text)
 
 
 if __name__ == "__main__":

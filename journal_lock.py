@@ -1,6 +1,6 @@
-"""Cross-language journal lock (Python + Node) via O_EXCL lockfile (C12).
+"""Python-only journal lock via O_EXCL lockfile (C12 / LITE_1).
 
-fcntl.flock was Python-only; Node has no portable flock. Both sides create
+Processes that write ``exec_journal.jsonl`` through ``exec_journal_io`` create
 ``exec_journal.lock`` exclusively, write pid, and unlink on release. Stale
 locks (dead pid) are broken after a short wait.
 """

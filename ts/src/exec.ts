@@ -1,6 +1,9 @@
 /**
  * Sign + send Meteora DLMM operations (devnet by default).
  * All dangerous logic lives here — cli.ts stays sterile.
+ *
+ * Send journal is owned by Python (@@JOURNAL markers on stderr). This process
+ * does not read or write the send-journal or its lock file.
  */
 import {
   Connection,
@@ -22,21 +25,8 @@ import {
   flagStr,
   parseArgs,
   prepareTxForSend,
-  requireFlag,
   rpcHostForLog,
 } from "./build_lib";
-import {
-  appendJournalEntry,
-  defaultJournalPath,
-  hasUnresolved,
-  isTransientRpcError,
-  pollSignatureStatus,
-  readJournal,
-  resolveJournalOnStartup,
-  unresolvedEntries,
-  updateJournalBySignature,
-  type JournalEntry,
-} from "./journal";
 import {
   assertSendAllowed,
   defaultRpcForNetwork,
@@ -54,6 +44,8 @@ type TxMeta = {
   base64: string;
   signers: string[];
 };
+
+type ConfirmOutcome = "confirmed" | "failed" | "unknown";
 
 const EXEC_COMMANDS = [
   "exec-open",
@@ -77,6 +69,165 @@ function buildActionForExec(cmd: ExecCommand): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Map tx meta / action to short journal kind for @@JOURNAL markers. */
+function journalKind(txKind: string, action: string): string {
+  const k = (txKind || "").toLowerCase();
+  if (
+    k === "open" ||
+    k === "close" ||
+    k === "swap" ||
+    k === "add" ||
+    k === "withdraw" ||
+    k === "claim"
+  ) {
+    return k;
+  }
+  const fromAction = action.replace(/^exec-/, "").replace(/^build-/, "");
+  if (fromAction === "close-empty") return "close";
+  if (fromAction === "claim-fees") return "claim";
+  if (
+    fromAction === "open" ||
+    fromAction === "close" ||
+    fromAction === "swap" ||
+    fromAction === "add" ||
+    fromAction === "withdraw"
+  ) {
+    return fromAction;
+  }
+  return "open";
+}
+
+const JOURNAL_HANDSHAKE_MS = Number(
+  process.env.METEORA_JOURNAL_HANDSHAKE_MS || "15000"
+);
+
+/** Emit machine marker for Python journal owner (parent acks on stdin). */
+function emitJournalSending(
+  index: number,
+  signature: string,
+  kind: string
+): void {
+  const line =
+    `@@JOURNAL ${JSON.stringify({
+      stage: "sending",
+      index,
+      signature,
+      kind,
+    })}\n`;
+  process.stderr.write(line);
+}
+
+/**
+ * Wait for parent journal ack on stdin.
+ * Returns true only for exact ``@@JOURNAL-OK <signature>``.
+ * FAIL / mismatch / timeout / stdin EOF → false (must not send).
+ */
+function awaitJournalHandshake(signature: string): Promise<boolean> {
+  const timeoutMs =
+    Number.isFinite(JOURNAL_HANDSHAKE_MS) && JOURNAL_HANDSHAKE_MS > 0
+      ? JOURNAL_HANDSHAKE_MS
+      : 15_000;
+  return new Promise((resolve) => {
+    let buf = "";
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.stdin.removeListener("data", onData);
+      process.stdin.removeListener("end", onEnd);
+      process.stdin.removeListener("error", onEnd);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    const onData = (chunk: Buffer | string) => {
+      buf += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      const nl = buf.indexOf("\n");
+      if (nl < 0) return;
+      const line = buf.slice(0, nl).trim();
+      if (line === `@@JOURNAL-OK ${signature}`) {
+        finish(true);
+        return;
+      }
+      // @@JOURNAL-FAIL, wrong signature, or garbage — refuse send.
+      finish(false);
+    };
+    const onEnd = () => finish(false);
+    process.stdin.on("data", onData);
+    process.stdin.on("end", onEnd);
+    process.stdin.on("error", onEnd);
+    if (process.stdin.isPaused()) process.stdin.resume();
+  });
+}
+
+/** Same transient class as former journal.ts / build_lib.withRpcRetry. */
+function isTransientRpcError(msg: string): boolean {
+  const low = msg.toLowerCase();
+  return (
+    msg.includes("429") ||
+    low.includes("too many requests") ||
+    low.includes("rate limit") ||
+    low.includes("fetch failed") ||
+    low.includes("socket hang up") ||
+    low.includes("network error") ||
+    low.includes("econnreset") ||
+    low.includes("econnrefused") ||
+    low.includes("etimedout") ||
+    low.includes("timeout") ||
+    low.includes("eai_again") ||
+    low.includes("502") ||
+    low.includes("503") ||
+    low.includes("504")
+  );
+}
+
+async function pollSignatureStatus(
+  connection: Connection,
+  signature: string,
+  timeoutMs = 90_000,
+  pollMs = 2_000
+): Promise<{
+  outcome: ConfirmOutcome;
+  slot: number | null;
+  error: string | null;
+}> {
+  const start = Date.now();
+  let lastError: string | null = null;
+  while (Date.now() - start < timeoutMs) {
+    let resp;
+    try {
+      resp = await connection.getSignatureStatuses([signature], {
+        searchTransactionHistory: true,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      lastError = msg;
+      if (isTransientRpcError(msg)) {
+        await sleep(pollMs);
+        continue;
+      }
+      await sleep(pollMs);
+      continue;
+    }
+    const st = resp.value[0];
+    if (st) {
+      if (st.err) {
+        return {
+          outcome: "failed",
+          slot: st.slot ?? null,
+          error: JSON.stringify(st.err),
+        };
+      }
+      const conf = st.confirmationStatus;
+      if (conf === "confirmed" || conf === "finalized") {
+        return { outcome: "confirmed", slot: st.slot ?? null, error: null };
+      }
+    }
+    await sleep(pollMs);
+  }
+  return { outcome: "unknown", slot: null, error: lastError };
 }
 
 function partialFillExtra(
@@ -153,7 +304,6 @@ async function sendBuildResult(
   action: string,
   build: Json,
   wallet: Keypair,
-  journalPath: string,
   positionKeypair?: Keypair,
   opts?: { crashAfterSend?: boolean }
 ): Promise<Json> {
@@ -210,19 +360,46 @@ async function sendBuildResult(
       );
     }
 
-    // Journal AFTER final sign so the recorded signature is the one on the wire.
-    const pending: JournalEntry = {
-      ts: new Date().toISOString(),
-      action,
-      network,
-      params: { ...params, txIndex: txMeta.index },
+    // Python owns the journal: marker + stdin ack before bytes hit the wire.
+    emitJournalSending(
+      txMeta.index,
       signature,
-      status: "pending",
-      slot: null,
-      error: null,
-      txIndex: txMeta.index,
-    };
-    appendJournalEntry(journalPath, pending);
+      journalKind(txMeta.kind, action)
+    );
+    const journalOk = await awaitJournalHandshake(signature);
+    if (!journalOk) {
+      const sendsSoFar = [
+        ...sends,
+        {
+          index: txMeta.index,
+          signature,
+          status: "not_sent",
+          sent: false,
+          slot: null,
+          explorer: explorerTxUrl(signature, network),
+          error: "journal-refused",
+        },
+      ];
+      const confirmed = sends.filter((s) => s.status === "confirmed").length;
+      fail(
+        action,
+        partialFillMessage(
+          txMeta.index,
+          txs.length,
+          confirmed,
+          `journal refused send for tx[${txMeta.index}] — not sent`
+        ),
+        "journal",
+        {
+          confirmationUnknown: false,
+          network,
+          signatures,
+          sends: sendsSoFar,
+          params,
+          ...partialFillExtra(sendsSoFar, txs.length),
+        }
+      );
+    }
 
     eprint(`sending tx[${txMeta.index}] signature=${signature}`);
     try {
@@ -233,10 +410,6 @@ async function sendBuildResult(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // Client send error ≠ proof the cluster rejected the tx (skipPreflight).
-      updateJournalBySignature(journalPath, signature, {
-        status: "unknown",
-        error: `send exception (may still land): ${msg}`,
-      });
       const sendsSoFar = [
         ...sends,
         {
@@ -285,11 +458,6 @@ async function sendBuildResult(
         : outcome === "failed"
           ? "failed"
           : "unknown";
-    updateJournalBySignature(journalPath, signature, {
-      status,
-      slot,
-      error,
-    });
 
     signatures.push(signature);
     sends.push({
@@ -324,7 +492,7 @@ async function sendBuildResult(
     if (status === "unknown") {
       eprint(
         `tx[${txMeta.index}] confirmation unknown — failing this exec; ` +
-          "journal left as unknown; do not retry blindly"
+          "do not retry blindly (Python journal left as unknown after sync)"
       );
       const confirmed = sends.filter((s) => s.status === "confirmed").length;
       fail(
@@ -366,82 +534,6 @@ async function sendBuildResult(
 async function main(): Promise<void> {
   const { cmd, flags } = parseArgs(process.argv.slice(2));
 
-  // Chat-reachable unlock path: re-poll unresolved journal entries (no send).
-  if (cmd === "resolve-journal") {
-    const network = parseNetwork(flags, cmd);
-    const rpc =
-      flagStr(flags, "rpc") || defaultRpcForNetwork(network);
-    const connection = new Connection(rpc, "confirmed");
-    const journalPath = defaultJournalPath();
-    const pollMs = Number(flagStr(flags, "poll-ms") || "1500");
-    // Default 25s per sig; wall budget shared so N stuck sigs still finish.
-    const perSigTimeout = Number(flagStr(flags, "timeout-ms") || "25000");
-    const wallMs = Number(flagStr(flags, "wall-ms") || "170000");
-    eprint(`resolve-journal rpc=${rpcHostForLog(rpc)} journal=${journalPath}`);
-    const before = unresolvedEntries(readJournal(journalPath));
-    const wallStart = Date.now();
-    let rpcDownHint: string | null = null;
-    for (const e of before) {
-      const remaining = wallMs - (Date.now() - wallStart);
-      if (remaining < 2_000) {
-        eprint("resolve-journal: wall budget exhausted — leaving rest unresolved");
-        break;
-      }
-      const thisTimeout = Math.min(perSigTimeout, remaining);
-      const { outcome, slot, error } = await pollSignatureStatus(
-        connection,
-        e.signature,
-        thisTimeout,
-        pollMs
-      );
-      if (
-        outcome === "unknown" &&
-        error &&
-        isTransientRpcError(error)
-      ) {
-        rpcDownHint =
-          "RPC unreachable or flaky — retry /status journal when the node is up, " +
-          "or check explorer and /status journal-forget <sig> confirm if the tx is final.";
-      }
-      if (outcome === "confirmed") {
-        updateJournalBySignature(journalPath, e.signature, {
-          status: "confirmed",
-          slot,
-          error: null,
-        });
-      } else if (outcome === "failed") {
-        updateJournalBySignature(journalPath, e.signature, {
-          status: "failed",
-          slot,
-          error,
-        });
-      }
-    }
-    const after = unresolvedEntries(readJournal(journalPath));
-    process.stdout.write(
-      JSON.stringify({
-        ok: true,
-        action: "resolve-journal",
-        network,
-        journalPath,
-        before: before.map((e) => ({
-          signature: e.signature,
-          status: e.status,
-          action: e.action,
-        })),
-        stillUnresolved: after.map((e) => ({
-          signature: e.signature,
-          status: e.status,
-          action: e.action,
-          explorer: explorerTxUrl(e.signature, network),
-        })),
-        cleared: before.length - after.length,
-        rpcHint: rpcDownHint,
-      }) + "\n"
-    );
-    return;
-  }
-
   if (!isExecCommand(cmd)) {
     fail(cmd, `unknown command: ${cmd}`, "parseArgs");
   }
@@ -449,7 +541,6 @@ async function main(): Promise<void> {
   const network = parseNetwork(flags, cmd);
   const send = flags["send"] === true;
   const dryRun = !send;
-  const forceIgnoreJournal = flags["force-ignore-journal"] === true;
   const crashAfterSend = flags["crash-after-send"] === true;
   try {
     assertSendAllowed(network, send, cmd);
@@ -458,37 +549,18 @@ async function main(): Promise<void> {
     fail(cmd, msg, "network");
   }
 
-  const rpc =
-    flagStr(flags, "rpc") || defaultRpcForNetwork(network);
+  const rpc = flagStr(flags, "rpc") || defaultRpcForNetwork(network);
   const poolStr = flagStr(flags, "pool", DEFAULT_POOL)!;
   const connection = new Connection(rpc, "confirmed");
   const pool = new PublicKey(poolStr);
-  const journalPath = defaultJournalPath();
 
   const { keypair: wallet, pubkey } = loadWalletKeypair(
     flagStr(flags, "wallet")
   );
   eprint(
     `cmd=${cmd} network=${network} rpc=${rpcHostForLog(rpc)} pool=${poolStr} wallet=${pubkey} ` +
-      `mode=${dryRun ? "dry-run" : "send"} journal=${journalPath}`
+      `mode=${dryRun ? "dry-run" : "send"}`
   );
-
-  if (!forceIgnoreJournal) {
-    await resolveJournalOnStartup(connection, journalPath);
-    const entries = readJournal(journalPath);
-    if (hasUnresolved(entries)) {
-      const open = unresolvedEntries(entries);
-      const sigs = open.map((e) => `${e.signature}(${e.status})`).join(", ");
-      fail(
-        cmd,
-        `journal has unresolved entries: ${sigs}. Resolve manually or use --force-ignore-journal`,
-        "journal"
-      );
-    }
-  } else {
-    eprint("warning: --force-ignore-journal — skipping journal block check");
-    await resolveJournalOnStartup(connection, journalPath);
-  }
 
   let positionKeypair: Keypair | undefined;
   if (cmd === "exec-open" && send) {
@@ -540,7 +612,6 @@ async function main(): Promise<void> {
     cmd,
     { ...build, action: buildAction },
     wallet,
-    journalPath,
     positionKeypair,
     { crashAfterSend }
   );
