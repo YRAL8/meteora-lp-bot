@@ -12,10 +12,12 @@ import meteora_ops
 import money_ops
 import monitor_timer_state
 import range_state
+import range_width_state
 import state_paths
 import telegram_commands as tg
 import telegram_notify
 from reopen_pending import is_reopen_pending, load_reopen_pending
+from range_width_state import RangeRestoreResult
 from telegram_notify import (
     escape_html,
     format_position_table,
@@ -876,6 +878,31 @@ async def main() -> None:
     state_paths.state_dir().mkdir(parents=True, exist_ok=True)
     out_of_range_since, last_auto_attempt_at = monitor_timer_state.load_timers()
 
+    range_restore = RangeRestoreResult(
+        source="env",
+        pct=range_state.current_range_pct(),
+        half=range_state.current_half_width(),
+    )
+    pool0: dict | None = None
+    try:
+        pool0 = meteora_ops.pool_info(**money_ops.ops_kwargs())
+        range_restore = range_width_state.restore_at_startup(
+            bin_step=int(pool0["binStep"]),
+            max_bins_per_position=int(pool0["maxBinsPerPosition"]),
+        )
+    except Exception:
+        log.exception("range width restore skipped — pool_info unavailable")
+        if range_width_state.STATE_PATH.is_file():
+            range_restore = RangeRestoreResult(
+                source="env",
+                pct=range_state.current_range_pct(),
+                half=range_state.current_half_width(),
+                warning=(
+                    "сохранённую ширину не проверил (пул недоступен) — "
+                    "оставил RANGE_WIDTH_PCT из .env"
+                ),
+            )
+
     rpc_url = bot_config.effective_rpc()
     rpc_host = _rpc_host_for_log(rpc_url)
 
@@ -982,11 +1009,40 @@ async def main() -> None:
         if bot_config.AUTO_REBALANCE
         else "только наблюдение (AUTO_REBALANCE=off)"
     )
+    # Width line for the boot message: actual corridor % when we know binStep.
+    boot_bin_step = int(pool0["binStep"]) if pool0 is not None else None
+    if boot_bin_step:
+        boot_pct = range_state.pct_from_half(range_restore.half, boot_bin_step)
+        asked = range_state.asked_pct_note(boot_pct, range_restore.pct)
+        corridor = range_state.corridor_bins(range_restore.half)
+        width_src = (
+            "из сохранённого состояния"
+            if range_restore.source == "state"
+            else "из .env (RANGE_WIDTH_PCT)"
+        )
+        width_line = (
+            f"Диапазон: ±{boot_pct:.2f}%{asked} ({corridor} ячеек) — {width_src}"
+        )
+    else:
+        width_src = (
+            "из сохранённого состояния"
+            if range_restore.source == "state"
+            else "из .env (RANGE_WIDTH_PCT)"
+        )
+        width_line = (
+            f"Диапазон: ±{range_restore.pct:g}% "
+            f"({range_state.corridor_bins(range_restore.half)} ячеек) — {width_src}"
+        )
+    boot_extra = ""
+    if range_restore.warning:
+        boot_extra = f"\n⚠️ {escape_html(range_restore.warning)}"
+
     send_telegram_message(
         f"🤖 <b>Meteora LP-бот запущен</b>\n"
         f"Режим: {mode} · сеть: {bot_config.effective_network()}\n"
         f"RPC: <code>{escape_html(rpc_host)}</code>\n"
         f"{auto_line} · выдержка {bot_config.REBALANCE_DELAY_MIN} мин\n"
+        f"{width_line}{boot_extra}\n"
         f"Пул: <code>{bot_config.pool_pubkey()}</code>\n"
         f"Опрос: {bot_config.POLL_INTERVAL_SEC} сек\n"
         f"Кнопки: /start"

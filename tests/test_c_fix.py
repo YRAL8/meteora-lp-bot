@@ -80,7 +80,8 @@ class SetrangeCeilingTests(unittest.IsolatedAsyncioTestCase):
             },
         ):
             with patch("money_ops.get_primary_position", return_value=None):
-                await tg.setrange_command(update, ctx)
+                with patch("range_width_state.save_range_width"):
+                    await tg.setrange_command(update, ctx)
         self.assertEqual(range_state.current_half_width(), 10)
         self.assertAlmostEqual(range_state.current_range_pct(), 0.1)
         text = "\n".join(msg.replies)
@@ -100,7 +101,8 @@ class SetrangeCeilingTests(unittest.IsolatedAsyncioTestCase):
             },
         ):
             with patch("money_ops.get_primary_position", return_value=None):
-                await tg.setrange_command(update, ctx)
+                with patch("range_width_state.save_range_width"):
+                    await tg.setrange_command(update, ctx)
         half = range_state.pct_to_half_width_bins(0.3, 1)
         self.assertEqual(range_state.current_half_width(), half)
         self.assertAlmostEqual(range_state.current_range_pct(), 0.3)

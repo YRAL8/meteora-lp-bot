@@ -140,6 +140,18 @@ def apply_setrange(
     )
     range_width_pct = float(pct)
     half_width_bins = half
+    try:
+        import range_width_state
+
+        range_width_state.save_range_width(range_width_pct, half_width_bins)
+    except OSError as e:
+        # Disk full / read-only volume must not undo an in-memory /setrange;
+        # the next restart would fall back to .env and warn.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "range_width.json not saved: %s", e
+        )
     return half
 
 

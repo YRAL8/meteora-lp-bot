@@ -148,6 +148,7 @@ class SetrangeCopyTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("money_ops.get_primary_position", return_value=None),
             patch("money_ops.ops_kwargs", return_value={}),
+            patch("range_width_state.save_range_width"),
         ):
             await tg.setrange_command(update, ctx)
         text = msg.replies[0]
@@ -158,6 +159,116 @@ class SetrangeCopyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("действует до перезапуска", text)
         self.assertNotIn("half_width_bins", text)
         self.assertIsNone(_find_bad_angle(text))
+
+
+class RangePersistTests(unittest.TestCase):
+    def test_save_restore_roundtrip(self) -> None:
+        import os
+        import tempfile
+
+        import range_width_state
+
+        prev_half = range_state.half_width_bins
+        prev_pct = range_state.range_width_pct
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["METEORA_STATE_DIR"] = td
+            # Re-bind path after env change (module holds STATE_PATH at import).
+            range_width_state.STATE_PATH = __import__(
+                "state_paths"
+            ).path("range_width.json")
+            range_state.apply_setrange(0.8, 4, max_bins_per_position=70)
+            self.assertTrue(range_width_state.STATE_PATH.is_file())
+            range_state.half_width_bins = 34
+            range_state.range_width_pct = 5.0
+            result = range_width_state.restore_at_startup(
+                bin_step=4, max_bins_per_position=70
+            )
+            self.assertEqual(result.source, "state")
+            self.assertIsNone(result.warning)
+            self.assertAlmostEqual(result.pct, 0.8)
+            self.assertEqual(result.half, range_state.pct_to_half_width_bins(0.8, 4))
+            self.assertEqual(range_state.current_range_pct(), 0.8)
+        range_state.half_width_bins = prev_half
+        range_state.range_width_pct = prev_pct
+
+    def test_missing_file_keeps_env(self) -> None:
+        import os
+        import tempfile
+
+        import range_width_state
+
+        prev_half = range_state.half_width_bins
+        prev_pct = range_state.range_width_pct
+        range_state.half_width_bins = 34
+        range_state.range_width_pct = 5.0
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["METEORA_STATE_DIR"] = td
+            range_width_state.STATE_PATH = __import__("state_paths").path(
+                "range_width.json"
+            )
+            result = range_width_state.restore_at_startup(
+                bin_step=4, max_bins_per_position=70
+            )
+            self.assertEqual(result.source, "env")
+            self.assertIsNone(result.warning)
+            self.assertEqual(range_state.current_half_width(), 34)
+            self.assertAlmostEqual(range_state.current_range_pct(), 5.0)
+        range_state.half_width_bins = prev_half
+        range_state.range_width_pct = prev_pct
+
+    def test_corrupt_file_falls_back_and_warns(self) -> None:
+        import os
+        import tempfile
+
+        import range_width_state
+
+        prev_half = range_state.half_width_bins
+        prev_pct = range_state.range_width_pct
+        range_state.half_width_bins = 34
+        range_state.range_width_pct = 5.0
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["METEORA_STATE_DIR"] = td
+            range_width_state.STATE_PATH = __import__("state_paths").path(
+                "range_width.json"
+            )
+            range_width_state.STATE_PATH.write_text("{not-json", encoding="utf-8")
+            result = range_width_state.restore_at_startup(
+                bin_step=4, max_bins_per_position=70
+            )
+            self.assertEqual(result.source, "env")
+            self.assertIsNotNone(result.warning)
+            self.assertIn(".env", result.warning or "")
+            self.assertEqual(range_state.current_half_width(), 34)
+            self.assertIsNone(_find_bad_angle(f"⚠️ {result.warning}"))
+        range_state.half_width_bins = prev_half
+        range_state.range_width_pct = prev_pct
+
+    def test_too_wide_for_pool_falls_back_and_warns(self) -> None:
+        import os
+        import tempfile
+
+        import range_width_state
+
+        prev_half = range_state.half_width_bins
+        prev_pct = range_state.range_width_pct
+        range_state.half_width_bins = 34
+        range_state.range_width_pct = 5.0
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["METEORA_STATE_DIR"] = td
+            range_width_state.STATE_PATH = __import__("state_paths").path(
+                "range_width.json"
+            )
+            # 5% is fine for binStep=4 but not for binStep=1 (~0.34% max).
+            range_width_state.save_range_width(5.0, 34)
+            result = range_width_state.restore_at_startup(
+                bin_step=1, max_bins_per_position=70
+            )
+            self.assertEqual(result.source, "env")
+            self.assertIsNotNone(result.warning)
+            self.assertIn(".env", result.warning or "")
+            self.assertEqual(range_state.current_half_width(), 34)
+        range_state.half_width_bins = prev_half
+        range_state.range_width_pct = prev_pct
 
 
 if __name__ == "__main__":
