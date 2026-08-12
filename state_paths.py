@@ -20,3 +20,8 @@ def state_dir() -> Path:
 
 def path(*parts: str) -> Path:
     return state_dir().joinpath(*parts)
+
+
+def bot_log_path() -> Path:
+    """Rotating bot log on the state volume (survives container recreate)."""
+    return path("bot.log")

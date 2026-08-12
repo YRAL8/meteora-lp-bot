@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
+from contextvars import ContextVar
 from typing import Any
 
 from telegram import BotCommand, Update
@@ -40,6 +42,80 @@ from telegram_notify import (
 )
 
 log = logging.getLogger(__name__)
+
+# Per-command outcome for the owner-command wrapper (ok / refused / exception).
+_cmd_outcome: ContextVar[tuple[str, str]] = ContextVar(
+    "_cmd_outcome", default=("ok", "")
+)
+
+
+def _mark_refused(reason: str) -> None:
+    kind, _ = _cmd_outcome.get()
+    if kind == "exception":
+        return
+    _cmd_outcome.set(("refused", reason))
+
+
+def _mark_exception(err: BaseException) -> None:
+    _cmd_outcome.set(("exception", f"{type(err).__name__}: {err}"))
+
+
+def _auto_refuse_reason(text: str) -> str | None:
+    first = (text or "").split("\n", 1)[0]
+    if first.startswith("❌"):
+        return first.lstrip("❌ ").strip()[:200] or "error"
+    if "Бот заморожен" in first:
+        return "frozen (/stop)"
+    if first.startswith("⏳") and "подожди" in first.lower():
+        return "money_lock busy"
+    if first.startswith("Использование:"):
+        return "usage"
+    if first.startswith("🚨"):
+        return first.lstrip("🚨 ").strip()[:200] or "aborted"
+    return None
+
+
+def _command_label(update: Update, fn: Any) -> str:
+    msg = update.effective_message
+    raw = getattr(msg, "text", None) if msg is not None else None
+    text = raw.strip() if isinstance(raw, str) else ""
+    if text.startswith("/"):
+        return text.split()[0].lstrip("/").split("@")[0]
+    name = fn.__name__
+    for suffix in ("_command", "_prompt", "_button"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def owner_command(fn):
+    """Log accept + outcome for every owner command. Does not change behaviour."""
+
+    @functools.wraps(fn)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        name = _command_label(update, fn)
+        raw_args = list(context.args or [])
+        log.info("accepted command %s args=%s", name, raw_args)
+        token = _cmd_outcome.set(("ok", ""))
+        try:
+            result = await fn(update, context, *args, **kwargs)
+        except Exception:
+            log.exception("command %s exception", name)
+            raise
+        else:
+            kind, detail = _cmd_outcome.get()
+            if kind == "refused":
+                log.info("command %s refused: %s", name, detail)
+            elif kind == "exception":
+                log.info("command %s exception: %s", name, detail)
+            else:
+                log.info("command %s ok", name)
+            return result
+        finally:
+            _cmd_outcome.reset(token)
+
+    return wrapper
+
 
 # Emergency /withdraw waits this long for money_lock (C12).
 WITHDRAW_LOCK_WAIT_SEC = 600.0
@@ -94,7 +170,15 @@ def _exec_kwargs() -> dict[str, Any]:
     return money_ops.exec_kwargs()
 
 
-async def _reply(update: Update, text: str, **kwargs: Any) -> None:
+async def _reply(
+    update: Update, text: str, *, refused: str | None = None, **kwargs: Any
+) -> None:
+    if refused is not None:
+        _mark_refused(refused)
+    else:
+        auto = _auto_refuse_reason(text)
+        if auto:
+            _mark_refused(auto)
     if update.effective_message is not None:
         await update.effective_message.reply_text(text, **kwargs)
 
@@ -116,6 +200,7 @@ async def _handle_journal_block(update: Update, err: BaseException) -> bool:
     text = str(err)
     if "journal has unresolved" not in text.lower() and "unresolved entries" not in text.lower():
         return False
+    _mark_refused("unresolved journal")
     await _reply(
         update,
         "⚠️ Журнал транзакций заблокировал денежную операцию. "
@@ -179,6 +264,7 @@ async def register_menu_commands(app: Application) -> None:
     await app.bot.set_my_commands(_MENU_COMMANDS)
 
 
+@owner_command
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = [a.lower() for a in (context.args or [])]
     if args and args[0] in ("journal", "journal-forget"):
@@ -271,6 +357,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _reply(update, "\n".join(lines), parse_mode="HTML")
     except Exception as e:
         log.exception("Ошибка /status")
+        _mark_exception(e)
         await _reply(update, f"❌ Ошибка /status: {e}")
 
 
@@ -516,6 +603,7 @@ def render_pnl_message(*, cycles: list[dict], recent_limit: int = 10) -> str:
     return text[:cut] + "\n… (обрезано)"
 
 
+@owner_command
 async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         j = cycle_journal.get_default_journal()
@@ -524,9 +612,11 @@ async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply(update, text, parse_mode="HTML")
     except Exception as e:
         log.exception("Ошибка /pnl")
+        _mark_exception(e)
         await _reply(update, f"❌ Ошибка /pnl: {e}")
 
 
+@owner_command
 async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await _reply(
@@ -668,6 +758,7 @@ def _parse_open_args(
     return amount, width_pct, confirm, None
 
 
+@owner_command
 async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if bot_state.bot_frozen:
         await _reply(update, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
@@ -793,6 +884,7 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await _reply(update, f"❌ Ошибка: {e}")
 
 
+@owner_command
 async def addliquidity_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -889,6 +981,7 @@ async def addliquidity_command(
             await _reply(update, f"❌ Ошибка: {e}")
 
 
+@owner_command
 async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Claim fees into the bot wallet; never closes the position."""
     if bot_state.bot_frozen:
@@ -1036,6 +1129,7 @@ def _parse_withdraw_args(
     return "partial", pct, confirm, None
 
 
+@owner_command
 async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Partial withdraw (1..99%) or full close (/withdraw confirm).
 
@@ -1197,6 +1291,7 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         bot_state.money_lock.release()
 
 
+@owner_command
 async def rebalance_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1350,6 +1445,7 @@ async def rebalance_command(
             await _reply(update, f"❌ Ошибка ребаланса: {e}")
 
 
+@owner_command
 async def pauza_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bot_state.bot_paused = True
     await _reply(
@@ -1360,6 +1456,7 @@ async def pauza_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+@owner_command
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bot_state.bot_frozen = True
     await _reply(
@@ -1372,6 +1469,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+@owner_command
 async def boevoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bot_state.bot_paused = False
     bot_state.bot_frozen = False
@@ -1382,6 +1480,7 @@ async def boevoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+@owner_command
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show persistent keyboard. Not part of the ten-command BotFather menu."""
     await _reply(
@@ -1394,6 +1493,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+@owner_command
 async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(
         update,
@@ -1403,6 +1503,7 @@ async def help_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+@owner_command
 async def open_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Keyboard «Открыть»: context + clickable /open N suggestions from balance."""
     try:
@@ -1461,6 +1562,7 @@ async def open_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply(update, f"❌ Не удалось подготовить подсказку /open: {e}")
 
 
+@owner_command
 async def addliquidity_prompt(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1509,6 +1611,7 @@ async def addliquidity_prompt(
         await _reply(update, f"❌ Не удалось подготовить подсказку: {e}")
 
 
+@owner_command
 async def setrange_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         pool = meteora_ops.pool_info(**money_ops.ops_kwargs())

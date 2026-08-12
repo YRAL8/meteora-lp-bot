@@ -19,6 +19,25 @@ import config
 ROOT = Path(__file__).resolve().parent
 CLI_JS = ROOT / "ts" / "dist" / "cli.js"
 
+# Node prints this twice per CLI call when the native bigint addon is missing.
+# Exact line only — any extra character must still reach the log.
+BIGINT_NOISE_LINE = (
+    "bigint: Failed to load bindings, pure JS will be used (try npm run rebuild?)"
+)
+
+
+def is_bigint_noise_line(line: str) -> bool:
+    return line.strip() == BIGINT_NOISE_LINE
+
+
+def emit_cli_stderr(stderr: str, *, file=None) -> None:
+    """Print child stderr, dropping only the exact bigint-bindings noise line."""
+    out = sys.stderr if file is None else file
+    for line in stderr.splitlines():
+        if is_bigint_noise_line(line):
+            continue
+        print(line, file=out)
+
 
 class MeteoraOpsError(RuntimeError):
     def __init__(self, payload: Dict[str, Any]):
@@ -68,7 +87,7 @@ def run_cli(
     stdout = (proc.stdout or "").strip()
     stderr = (proc.stderr or "").strip()
     if stderr:
-        print(stderr, file=sys.stderr)
+        emit_cli_stderr(stderr)
 
     if not stdout:
         raise RuntimeError(

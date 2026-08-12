@@ -22,6 +22,7 @@ import requests
 
 import config
 import exec_journal_io
+import meteora_ops
 
 ROOT = Path(__file__).resolve().parent
 EXEC_JS = ROOT / "ts" / "dist" / "exec.js"
@@ -243,7 +244,7 @@ def _handle_journal_stderr_line(
 ) -> None:
     """Process one stderr line; on ``@@JOURNAL`` write pending and ack via stdin."""
     if not line.startswith("@@JOURNAL "):
-        if line.strip():
+        if line.strip() and not meteora_ops.is_bigint_noise_line(line):
             print(line, file=sys.stderr)
         return
     raw = line[len("@@JOURNAL ") :].strip()

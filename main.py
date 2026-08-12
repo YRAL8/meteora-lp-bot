@@ -6,6 +6,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import bot_config
+import bot_logging
 import bot_state
 import meteora_cycle_journal as cycle_journal
 import meteora_ops
@@ -29,7 +30,7 @@ from telegram_notify import (
     send_telegram_message,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+bot_logging.configure_console_logging()
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -492,8 +493,11 @@ async def monitor_position(*, now: datetime | None = None) -> None:
 
     _last_monitor_tick_at = datetime.now(timezone.utc)
 
-    if bot_state.bot_paused or bot_state.bot_frozen:
-        log.info("Бот на паузе/заморожен — пропускаю тик мониторинга")
+    if bot_state.bot_frozen:
+        log.info("пропускаю тик: /stop — ребаланс не сделан")
+        return
+    if bot_state.bot_paused:
+        log.info("пропускаю тик: /pauza — ребаланс не сделан")
         return
 
     if bot_state.money_lock.locked():
@@ -594,7 +598,8 @@ async def monitor_position(*, now: datetime | None = None) -> None:
             _reset_rebalance_blocked_state()
             since_str = out_of_range_since.replace(microsecond=0).isoformat()
             log.warning(
-                "Цена вышла за границу — жду %s мин (AUTO_REBALANCE=%s)",
+                "Цена вышла за границу с %s — жду %s мин (AUTO_REBALANCE=%s)",
+                since_str,
                 bot_config.REBALANCE_DELAY_MIN,
                 bot_config.AUTO_REBALANCE,
             )
@@ -857,6 +862,7 @@ async def monitor_position(*, now: datetime | None = None) -> None:
                 _persist_timers()
                 _record_rebalance(now)
                 _reset_rebalance_blocked_state()
+                log.info("авто-ребаланс завершён успешно")
                 send_telegram_message("✅ Авто-ребаланс завершён.")
             except SystemExit:
                 raise
@@ -877,6 +883,7 @@ async def main() -> None:
 
     _assert_mainnet_rpc_explicit()
     state_paths.state_dir().mkdir(parents=True, exist_ok=True)
+    bot_logging.attach_state_file_log()
     out_of_range_since, last_auto_attempt_at = monitor_timer_state.load_timers()
 
     range_restore = RangeRestoreResult(
