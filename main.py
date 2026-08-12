@@ -24,6 +24,7 @@ from telegram_notify import (
     format_price_trend,
     format_range_bar,
     format_stamp,
+    mode_label,
     position_in_range,
     send_telegram_message,
 )
@@ -181,7 +182,7 @@ def format_heartbeat(*, now: datetime | None = None) -> str:
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
 
-    mode = "DEMO" if bot_config.DRY_RUN else "БОЕВОЙ"
+    mode = mode_label()
     net = bot_config.effective_network()
     lines = [
         f"💓 <b>Сердцебиение [{mode}]</b> · {escape_html(net)}",
@@ -1003,7 +1004,7 @@ async def main() -> None:
         except Exception:
             log.exception("Telegram токен невалиден — polling отключён")
 
-    mode = "DEMO/devnet" if bot_config.DRY_RUN else "БОЕВОЙ"
+    mode = f"{mode_label()}/devnet" if bot_config.DRY_RUN else mode_label()
     auto_line = (
         "авто-ребаланс ВКЛ"
         if bot_config.AUTO_REBALANCE

@@ -34,6 +34,7 @@ from telegram_notify import (
     format_price_trend,
     format_range_bar,
     format_stamp,
+    mode_label,
     position_in_range,
     short_addr,
 )
@@ -68,7 +69,7 @@ _MENU_COMMANDS = [
     BotCommand("setrange", "Изменить ширину диапазона (нужен %)"),
     BotCommand("pauza", "Пауза автоматики"),
     BotCommand("stop", "Полная заморозка"),
-    BotCommand("boevoy", "Вернуть в боевой режим"),
+    BotCommand("boevoy", "Снять паузу и заморозку"),
     BotCommand("withdraw", "Закрыть позицию (нужно подтверждение)"),
 ]
 
@@ -188,7 +189,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         bal = await _run_money(meteora_ops.balances, owner, **kw)
         pool = await _run_money(meteora_ops.pool_info, **kw)
         positions = await _run_money(money_ops.list_open_positions)
-        mode = "DEMO" if bot_config.DRY_RUN else "БОЕВОЙ"
+        mode = mode_label()
         net = bot_config.effective_network()
         sol_ui = (bal.get("sol") or {}).get("ui", 0)
         usdc_ui = (bal.get("usdc") or {}).get("ui", 0)
@@ -1158,7 +1159,7 @@ async def boevoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     bot_state.bot_frozen = False
     await _reply(
         update,
-        "⚔️ Боевой режим — автоматика и все ручные команды снова работают.",
+        "▶️ Бот снова в работе — автоматика и все ручные команды доступны.",
         reply_markup=kb.build_main_keyboard(),
     )
 

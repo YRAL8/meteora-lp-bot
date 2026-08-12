@@ -24,6 +24,11 @@ def escape_html(text: object) -> str:
     return html.escape(str(text), quote=False)
 
 
+def mode_label() -> str:
+    """Что стоит на кону — деньги или проба. Одно место на все сообщения."""
+    return "демо" if bot_config.DRY_RUN else "реальные деньги"
+
+
 def format_stamp(now: datetime | None = None) -> str:
     """Дата и время для человека: местное, плюс UTC — журнал ведётся в UTC.
 
@@ -41,7 +46,9 @@ def format_stamp(now: datetime | None = None) -> str:
         # Нет tzdata в образе или опечатка в поясе — показываем UTC, но никогда
         # не молчим и не падаем: отметка времени не стоит потерянного сообщения.
         return now.strftime("%d.%m.%Y %H:%M UTC")
-    return f"{local:%d.%m.%Y %H:%M %Z} · {now:%H:%M} UTC"
+    # Город, а не аббревиатура пояса: «Berlin» читается, «CEST» надо помнить.
+    city = bot_config.DISPLAY_TIMEZONE.rsplit("/", 1)[-1].replace("_", " ")
+    return f"{local:%d.%m.%Y %H:%M} {city}"
 
 
 def format_html_error(prefix: str, err: object) -> str:

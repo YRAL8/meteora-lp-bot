@@ -271,8 +271,9 @@ class StampTests(unittest.TestCase):
             s = format_stamp(now)
         self.assertIn("12.08.2026", s)
         self.assertIn("12:39", s)
-        self.assertIn("10:39", s)
-        self.assertIn("UTC", s)
+        self.assertIn("Berlin", s)
+        # Одно время, местное: владелец попросил убрать вторую отметку.
+        self.assertNotIn("10:39", s)
 
     def test_naive_datetime_treated_as_utc(self) -> None:
         import bot_config
