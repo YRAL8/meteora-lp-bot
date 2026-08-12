@@ -160,3 +160,24 @@ def current_half_width() -> int:
 
 def current_range_pct() -> float:
     return float(range_width_pct)
+
+
+def corridor_bins(half: int | None = None) -> int:
+    """Full bin corridor width: activeId ± half → 2*half+1 bins."""
+    h = current_half_width() if half is None else int(half)
+    return 2 * h + 1
+
+
+def pct_from_half(half: int, bin_step: int) -> float:
+    """Actual ±% covered by ``half`` bins on this pool (geometric bins)."""
+    if bin_step <= 0:
+        raise ValueError("binStep must be > 0")
+    return ((1.0 + bin_step / 10_000.0) ** int(half) - 1.0) * 100.0
+
+
+def asked_pct_note(actual_pct: float, requested_pct: float) -> str:
+    """Short '(просили X%)' when rounded display differs; else empty."""
+    if round(float(actual_pct), 2) == round(float(requested_pct), 2):
+        return ""
+    return f" (просили {float(requested_pct):g}%)"
+

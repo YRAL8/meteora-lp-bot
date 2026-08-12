@@ -105,8 +105,9 @@ class SetrangeCeilingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(range_state.current_half_width(), half)
         self.assertAlmostEqual(range_state.current_range_pct(), 0.3)
         text = "\n".join(msg.replies)
-        self.assertIn("RANGE_WIDTH_PCT", text)
-        self.assertIn(f"half_width_bins={half}", text)
+        self.assertIn("Диапазон:", text)
+        self.assertIn(f"{range_state.corridor_bins(half)} ячеек", text)
+        self.assertNotIn("действует до перезапуска", text)
 
 
 class OpenCeilingTests(unittest.TestCase):

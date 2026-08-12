@@ -249,9 +249,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # а не сохранённый процент: при старте они расходятся (пришедшие из env 5%
         # против дефолтных 34 ячеек = ±0.34% на binStep=1), и цифра врала бы.
         half = range_state.current_half_width()
-        actual_pct = ((1.0 + bin_step / 10_000.0) ** half - 1.0) * 100.0
+        actual_pct = range_state.pct_from_half(half, bin_step)
+        asked = range_state.asked_pct_note(
+            actual_pct, range_state.current_range_pct()
+        )
+        corridor = range_state.corridor_bins(half)
         lines.append(
-            f"<i>Новые позиции: ±{actual_pct:.2f}% ({half} ячеек){cap_note}</i>"
+            f"<i>Новые позиции: ±{actual_pct:.2f}%{asked} "
+            f"({corridor} ячеек){cap_note}</i>"
         )
         lines.append(
             f"<i>{net} · кошелёк {short_addr(owner)} · пул "
@@ -554,26 +559,27 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lo = active_id - half
         hi = active_id + half
         lo_p, hi_p = money_ops.bin_prices(active_id, price, bin_step, lo, hi)
+        actual_pct = range_state.pct_from_half(half, bin_step)
+        asked = range_state.asked_pct_note(actual_pct, pct)
+        corridor = range_state.corridor_bins(half)
         pos = money_ops.get_primary_position()
         if pos:
             range_block = (
-                f"Текущая открытая позиция НЕ меняется: "
-                f"bins [{pos['lowerBinId']},{pos['upperBinId']}]\n"
-                f"Ориентировочно при следующем /rebalance или /open: "
-                f"~${lo_p:.4f}–${hi_p:.4f} (bins [{lo},{hi}], half={half})\n"
+                "Текущая открытая позиция НЕ меняется.\n"
+                "Ориентировочно при следующем /rebalance или /open — "
+                f"от ${lo_p:.2f} до ${hi_p:.2f}.\n"
             )
         else:
             range_block = (
-                f"При следующем /open: bins [{lo},{hi}] "
-                f"(~${lo_p:.4f}–${hi_p:.4f}), half={half}\n"
+                f"При следующем /open: от ${lo_p:.2f} до ${hi_p:.2f}.\n"
             )
         await _reply(
             update,
-            f"✅ <b>RANGE_WIDTH_PCT = ±{pct}%</b>\n"
-            f"binStep={bin_step} → half_width_bins={half}\n"
-            f"📈 Цена SOL: ${price:.4f}\n"
+            f"✅ <b>Диапазон: ±{actual_pct:.2f}%{asked}</b> — "
+            f"от ${lo_p:.2f} до ${hi_p:.2f}\n"
             f"{range_block}"
-            f"Изменение действует до перезапуска бота.",
+            f"<i>binStep={bin_step} · {corridor} ячеек · "
+            f"bins [{lo},{hi}] · цена ${price:.2f}</i>",
             parse_mode="HTML",
         )
     except range_state.RangeTooWideError as e:
@@ -1192,7 +1198,9 @@ async def open_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # range_width_pct: при старте тот приходит из env (5%) и не совпадает с
         # дефолтными 34 ячейками (±0.34% при binStep=1) — подсказка бы врала.
         bin_step = int(pool["binStep"])
-        pct = ((1.0 + bin_step / 10_000.0) ** half - 1.0) * 100.0
+        pct = range_state.pct_from_half(half, bin_step)
+        asked = range_state.asked_pct_note(pct, range_state.current_range_pct())
+        corridor = range_state.corridor_bins(half)
         existing = money_ops.get_primary_position()
         if existing is not None:
             val = money_ops.position_value_usd(existing, price)
@@ -1221,7 +1229,7 @@ async def open_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"🆕 <b>Открыть позицию</b>\n"
             f"На кошельке: {sol_ui:.4f} SOL + {usdc_ui:.2f} USDC "
             f"(≈${wallet_usd:.0f})\n"
-            f"Диапазон сейчас: ±{pct:.2f}% ({half} ячеек)\n\n"
+            f"Диапазон сейчас: ±{pct:.2f}%{asked} ({corridor} ячеек)\n\n"
             f"Отправь сумму в USDC-эквиваленте (нажми пример):\n"
             f"{examples}",
             parse_mode="HTML",
@@ -1288,6 +1296,9 @@ async def setrange_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         max_half = range_state.max_half_width_bins(max_bins)
         cur = range_state.current_range_pct()
         half = range_state.current_half_width()
+        actual = range_state.pct_from_half(half, bin_step)
+        asked = range_state.asked_pct_note(actual, cur)
+        corridor = range_state.corridor_bins(half)
         opts = kb.suggest_range_pcts(
             current_pct=cur,
             max_pct=max_pct,
@@ -1297,12 +1308,14 @@ async def setrange_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _reply(
             update,
             f"📐 <b>Диапазон</b>\n"
-            f"Сейчас: ±{cur:g}% (half={half} ячеек)\n"
-            f"Максимум на этом пуле (binStep={bin_step}): ±{max_pct:.4f}% "
-            f"(half ≤ {max_half}, ≤{max_bins} ячеек в позиции)\n"
+            f"Сейчас: ±{actual:.2f}%{asked} ({corridor} ячеек)\n"
+            f"Максимум на этом пуле: ±{max_pct:.2f}% "
+            f"({range_state.corridor_bins(max_half)} ячеек)\n"
             f"Минимум ввода: {range_state.MIN_RANGE_PCT}%\n\n"
             f"Отправь процент или нажми пример:\n"
-            f"{examples}",
+            f"{examples}\n"
+            f"<i>binStep={bin_step} · half ≤ {max_half} · "
+            f"≤{max_bins} ячеек в позиции</i>",
             parse_mode="HTML",
         )
     except Exception as e:

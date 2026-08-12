@@ -496,16 +496,18 @@ def build_open_estimate(
         half = range_state.half_width_for_pct(
             float(width_pct), bin_step, max_bins_per_position=max_bins
         )
-        pct_display = float(width_pct)
+        requested_pct = float(width_pct)
         width_source = "из команды (настройка не менялась)"
     else:
         half = range_state.current_half_width()
-        pct_display = range_state.current_range_pct()
+        requested_pct = range_state.current_range_pct()
         width_source = "из настройки /setrange"
 
+    actual_pct = range_state.pct_from_half(half, bin_step)
+    asked = range_state.asked_pct_note(actual_pct, requested_pct)
     lo = active_id - half
     hi = active_id + half
-    width_bins = hi - lo + 1
+    width_bins = range_state.corridor_bins(half)
     lo_p, hi_p = bin_prices(active_id, price, bin_step, lo, hi)
 
     notes: list[str] = []
@@ -563,6 +565,14 @@ def build_open_estimate(
         price=price,
         swap_suggestion=swap_sug if isinstance(swap_sug, dict) else None,
     )
+    short = bool(shortfalls)
+
+    # Same wallet-capacity idea as open_with_budget after a failed swap
+    # (usable SOL already excludes fee+position rent; subtract pending ATA rent).
+    sol_for_lp = max(0.0, usable_sol - ata_rent_sol)
+    affordable_now = (sol_for_lp * price + usdc_have) * 0.95
+    if bot_config.MAX_POSITION_USD is not None:
+        affordable_now = min(affordable_now, float(bot_config.MAX_POSITION_USD))
 
     lines: list[str] = [
         "🆕 <b>Открытие позиции — проверьте перед подтверждением</b>",
@@ -570,47 +580,75 @@ def build_open_estimate(
         f"Кошелёк: {sol_have:.4f} SOL + {usdc_have:.2f} USDC  "
         f"(всего ${wallet_usd:.2f})",
         "",
-        f"Диапазон: ±{pct_display:g}% — от ${lo_p:.2f} до ${hi_p:.2f}",
+        f"Диапазон: ±{actual_pct:.2f}%{asked} — от ${lo_p:.2f} до ${hi_p:.2f}",
         f"          (сейчас ${price:.2f}, {width_bins} ячеек,",
         f"          ширина {width_source})",
         "",
-        "Куда уйдут деньги:",
-        f"  • в пул          ${budget:.2f}   работает",
-        f"  • залог          {rent_sol:.4f} SOL = ${rent_usd:.2f}   "
-        f"вернётся при закрытии",
     ]
-    if ata_missing:
-        labels = " + ".join(ata_missing)
+
+    if short:
         lines.append(
-            f"  • залог ATA ({labels})  {ata_rent_sol:.4f} SOL = ${ata_usd:.2f}   "
-            f"вернётся при закрытии счетов"
+            "❌ Не хватает: "
+            + " и ".join(shortfalls)
+            + ". Смета ничего не отправляет."
         )
-    lines.append(
-        f"  • на комиссии    {fee_sol:.4f} SOL = ${fee_usd:.2f}   "
-        f"тратится по копейке"
-    )
-    lines.append(f"  • свободно после ${free_after:.2f}")
+        if affordable_now >= _MIN_OPEN_USD:
+            lines.append(f"Сейчас хватит на ~${affordable_now:.2f}.")
+        lines.append("")
+        lines.append("Почему не хватает (резервы, которые нельзя вложить в пул):")
+        lines.append(
+            f"  • залог          {rent_sol:.4f} SOL = ${rent_usd:.2f}   "
+            f"вернётся при закрытии"
+        )
+        if ata_missing:
+            labels = " + ".join(ata_missing)
+            lines.append(
+                f"  • залог ATA ({labels})  {ata_rent_sol:.4f} SOL = ${ata_usd:.2f}   "
+                f"вернётся при закрытии счетов"
+            )
+        lines.append(
+            f"  • на комиссии    {fee_sol:.4f} SOL = ${fee_usd:.2f}   "
+            f"тратится по копейке"
+        )
+        lines.append(
+            f"  • запрошено в пул  ${budget:.2f}   "
+            f"(этих денег на кошельке нет)"
+        )
+    else:
+        lines.append("Куда уйдут деньги:")
+        lines.append(f"  • в пул          ${budget:.2f}   работает")
+        lines.append(
+            f"  • залог          {rent_sol:.4f} SOL = ${rent_usd:.2f}   "
+            f"вернётся при закрытии"
+        )
+        if ata_missing:
+            labels = " + ".join(ata_missing)
+            lines.append(
+                f"  • залог ATA ({labels})  {ata_rent_sol:.4f} SOL = ${ata_usd:.2f}   "
+                f"вернётся при закрытии счетов"
+            )
+        lines.append(
+            f"  • на комиссии    {fee_sol:.4f} SOL = ${fee_usd:.2f}   "
+            f"тратится по копейке"
+        )
+        # Never print a negative remainder — shortfall branch handles that case.
+        if free_after >= -1e-9:
+            lines.append(f"  • свободно после ${max(0.0, free_after):.2f}")
+
     lines.append("")
 
     for n in notes:
-        # Cap announcements use raw "$" — fine in HTML; escape any stray angles.
         lines.append(escape_html(n))
 
     swap_line = format_swap_line(swap_sug if isinstance(swap_sug, dict) else None)
     if swap_line:
         lines.append(swap_line)
-    else:
+    elif not short:
         lines.append("Обмен не нужен — пропорция уже на кошельке.")
 
-    if shortfalls:
-        lines.append("")
-        lines.append(
-            "❌ Не хватает средств на депозит (после запланированного обмена): "
-            + " и ".join(shortfalls)
-            + ". Дошли и снова /open — смета ничего не отправляет."
-        )
+    if short:
+        lines.append("Дошли и снова /open — confirm не предлагается.")
     else:
-        # Confirm command must repeat the same amount and optional width.
         if width_pct is not None:
             confirm_cmd = f"/open {requested_usd:g} {width_pct:g} confirm"
         else:
