@@ -163,7 +163,8 @@ class OpenEstimateUnitTests(unittest.TestCase):
         ):
             text = money_ops.build_open_estimate(10.0)
 
-        self.assertIn("Не хватает", text)
+        # Смысл, а не написание: слово может стоять внутри предложения.
+        self.assertIn("не хватает", text.lower())
         self.assertNotIn("Подтвердить:", text)
 
 

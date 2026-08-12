@@ -114,14 +114,44 @@ class ShortfallCopyTests(unittest.TestCase):
             patch("money_ops.ops_kwargs", return_value={}),
         ):
             text = money_ops.build_open_estimate(10.0)
-        self.assertIn("Не хватает", text)
+        self.assertIn("не хватает", text.lower())
         self.assertNotIn("Подтвердить:", text)
         self.assertNotRegex(text, r"свободно после\s*\$-")
         # No negative dollar amounts anywhere in the message.
         for m in re.finditer(r"\$\s*-", text):
             self.fail(f"negative dollar amount in estimate: {text[m.start():m.start()+20]!r}")
         self.assertIn("запрошено в пул", text)
+        # SOL here (0.0494) does not even cover reserves (0.0774), so nothing is
+        # openable — USDC alone must not be advertised as an openable amount.
+        self.assertIn("Открыть нельзя ничего", text)
+        self.assertNotIn("Сейчас хватит на", text)
+        self.assertIsNone(_find_bad_angle(text))
+
+    def test_affordable_shown_when_sol_covers_reserves(self) -> None:
+        """The other side of the same branch: real headroom → real number."""
+        with (
+            patch.object(bot_config, "MAX_POSITION_USD", None),
+            patch("money_ops.meteora_ops.pool_info", return_value=_pool()),
+            patch(
+                "money_ops.meteora_ops.balances",
+                return_value=_bal(sol=0.20, usdc=1.0),
+            ),
+            patch(
+                "money_ops.suggest_for_budget",
+                return_value={
+                    "needSol": 0.0652,
+                    "needUsdc": 5.0,
+                    "params": {"usdcPerSol": 76.67},
+                    "swapSuggestion": None,
+                },
+            ),
+            patch("money_ops.owner", return_value="Owner"),
+            patch("money_ops.ops_kwargs", return_value={}),
+        ):
+            text = money_ops.build_open_estimate(10.0)
+        self.assertIn("Не хватает", text)
         self.assertIn("Сейчас хватит на", text)
+        self.assertNotIn("Открыть нельзя ничего", text)
         self.assertIsNone(_find_bad_angle(text))
 
 

@@ -567,12 +567,20 @@ def build_open_estimate(
     )
     short = bool(shortfalls)
 
-    # Same wallet-capacity idea as open_with_budget after a failed swap
-    # (usable SOL already excludes fee+position rent; subtract pending ATA rent).
-    sol_for_lp = max(0.0, usable_sol - ata_rent_sol)
+    # Same wallet-capacity idea as open_with_budget after a failed swap.
+    # NB: solAvailableForOpen is clamped at zero on the TS side, so it cannot
+    # tell "exactly enough for the reserves" from "short of them". Recompute the
+    # headroom unclamped: the deposit is payable in SOL only, so when SOL does
+    # not cover reserves, no position of any size is possible and USDC alone
+    # must not be reported as an openable amount.
+    sol_headroom = sol_have - fee_sol - rent_sol - ata_rent_sol
+    sol_missing_for_any_open = max(0.0, -sol_headroom)
+    sol_for_lp = max(0.0, sol_headroom)
     affordable_now = (sol_for_lp * price + usdc_have) * 0.95
     if bot_config.MAX_POSITION_USD is not None:
         affordable_now = min(affordable_now, float(bot_config.MAX_POSITION_USD))
+    if sol_missing_for_any_open > 0:
+        affordable_now = 0.0
 
     lines: list[str] = [
         "🆕 <b>Открытие позиции — проверьте перед подтверждением</b>",
@@ -587,13 +595,26 @@ def build_open_estimate(
     ]
 
     if short:
-        lines.append(
-            "❌ Не хватает: "
-            + " и ".join(shortfalls)
-            + ". Смета ничего не отправляет."
-        )
-        if affordable_now >= _MIN_OPEN_USD:
-            lines.append(f"Сейчас хватит на ~${affordable_now:.2f}.")
+        if sol_missing_for_any_open > 0:
+            # One statement, blocking fact first: two separate "не хватает"
+            # lines with different numbers read as a contradiction.
+            lines.append(
+                f"❌ Открыть нельзя ничего: не хватает "
+                f"{sol_missing_for_any_open:.4f} SOL "
+                f"(~${sol_missing_for_any_open * price:.2f}) даже на резервы — "
+                f"залог платится только в SOL, одним USDC его не закрыть.\n"
+                f"На запрошенные ${budget:.2f} нужно "
+                + " и ".join(shortfalls)
+                + ". Смета ничего не отправляет."
+            )
+        else:
+            lines.append(
+                "❌ Не хватает: "
+                + " и ".join(shortfalls)
+                + ". Смета ничего не отправляет."
+            )
+            if affordable_now >= _MIN_OPEN_USD:
+                lines.append(f"Сейчас хватит на ~${affordable_now:.2f}.")
         lines.append("")
         lines.append("Почему не хватает (резервы, которые нельзя вложить в пул):")
         lines.append(

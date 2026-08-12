@@ -254,9 +254,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             actual_pct, range_state.current_range_pct()
         )
         corridor = range_state.corridor_bins(half)
+        # One parenthesis, not two in a row: "(просили 1.3%) (65 ячеек)" reads
+        # like a stutter on a line the owner scans every time.
+        inside = f"{corridor} ячеек"
+        if asked:
+            inside = f"{asked.strip().strip('()')}, {inside}"
         lines.append(
-            f"<i>Новые позиции: ±{actual_pct:.2f}%{asked} "
-            f"({corridor} ячеек){cap_note}</i>"
+            f"<i>Новые позиции: ±{actual_pct:.2f}% ({inside}){cap_note}</i>"
         )
         lines.append(
             f"<i>{net} · кошелёк {short_addr(owner)} · пул "
@@ -565,14 +569,13 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pos = money_ops.get_primary_position()
         if pos:
             range_block = (
-                "Текущая открытая позиция НЕ меняется.\n"
-                "Ориентировочно при следующем /rebalance или /open — "
-                f"от ${lo_p:.2f} до ${hi_p:.2f}.\n"
+                "Текущая открытая позиция НЕ меняется — только следующая.\n"
+                "Запомнено — переживёт перезапуск бота.\n"
             )
         else:
-            range_block = (
-                f"При следующем /open: от ${lo_p:.2f} до ${hi_p:.2f}.\n"
-            )
+            # The corridor is already in the headline; repeating it verbatim
+            # here just made the reader check whether the numbers differed.
+            range_block = "Запомнено — переживёт перезапуск бота.\n"
         await _reply(
             update,
             f"✅ <b>Диапазон: ±{actual_pct:.2f}%{asked}</b> — "
