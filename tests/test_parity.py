@@ -151,6 +151,7 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
                 "rebalance",
                 "addliquidity",
                 "open",
+                "claim",
                 "setrange",
                 "pauza",
                 "stop",
@@ -158,6 +159,7 @@ class TelegramCommandTests(unittest.IsolatedAsyncioTestCase):
                 "withdraw",
             ],
         )
+        # claim is intentional divergence from Orca (fees without closing).
         self.assertNotIn("close", names)
         self.assertNotIn("swap", names)
 

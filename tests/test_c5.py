@@ -63,7 +63,7 @@ class KeyboardConsistencyTests(unittest.TestCase):
         for label in kb.all_button_labels():
             self.assertIn(label, text)
 
-    def test_menu_still_ten_commands(self) -> None:
+    def test_menu_lists_owner_commands(self) -> None:
         names = [c.command for c in tg._MENU_COMMANDS]
         self.assertEqual(
             names,
@@ -73,6 +73,7 @@ class KeyboardConsistencyTests(unittest.TestCase):
                 "rebalance",
                 "addliquidity",
                 "open",
+                "claim",
                 "setrange",
                 "pauza",
                 "stop",

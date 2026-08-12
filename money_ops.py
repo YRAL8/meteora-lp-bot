@@ -998,6 +998,107 @@ def _position_has_liquidity(position: dict) -> bool:
     return tx not in ("0", "") or ty not in ("0", "")
 
 
+def position_fees_usd(position: dict, usdc_per_sol: float) -> float:
+    fees = position.get("fees") or {}
+    return float(fees.get("sol") or 0) * usdc_per_sol + float(fees.get("usdc") or 0)
+
+
+def fees_are_zero(position: dict) -> bool:
+    fees = position.get("fees") or {}
+    return float(fees.get("sol") or 0) <= 1e-12 and float(fees.get("usdc") or 0) <= 1e-9
+
+
+def format_claim_estimate(position: dict, usdc_per_sol: float) -> str:
+    """Read-only claim preview. Never signs or sends."""
+    fees = position.get("fees") or {}
+    fee_sol = float(fees.get("sol") or 0)
+    fee_usdc = float(fees.get("usdc") or 0)
+    fee_usd = fee_sol * usdc_per_sol + fee_usdc
+    pk = escape_html(str(position.get("pubkey") or "?"))
+    if fees_are_zero(position):
+        return (
+            "💸 <b>Комиссии</b>\n"
+            f"Позиция <code>{pk}</code>\n\n"
+            "Сейчас накопленных комиссий нет — отправлять нечего.\n"
+            "Позиция не закрывается этой командой."
+        )
+    return (
+        "💸 <b>Забрать комиссии — проверьте перед подтверждением</b>\n"
+        f"Позиция <code>{pk}</code>\n\n"
+        f"Накоплено: {fee_sol:.6f} SOL (~${fee_sol * usdc_per_sol:.2f}) + "
+        f"{fee_usdc:.4f} USDC\n"
+        f"Всего ≈ ${fee_usd:.2f}\n\n"
+        "Позиция останется открытой. Деньги — в кошелёк бота "
+        "(никуда отдельно не переводятся).\n\n"
+        "Подтвердить: <code>/claim confirm</code>"
+    )
+
+
+def format_partial_withdraw_estimate(
+    position: dict, pct: int, usdc_per_sol: float
+) -> str:
+    """Read-only partial withdraw preview from on-hand legs. Never sends."""
+    if not (1 <= int(pct) <= 99):
+        raise ValueError("pct must be 1..99")
+    sol = float(position.get("sol") or 0)
+    usdc = float(position.get("usdc") or 0)
+    out_sol = sol * pct / 100.0
+    out_usdc = usdc * pct / 100.0
+    left_sol = sol - out_sol
+    left_usdc = usdc - out_usdc
+    out_usd = out_sol * usdc_per_sol + out_usdc
+    left_usd = left_sol * usdc_per_sol + left_usdc
+    total_usd = sol * usdc_per_sol + usdc
+    pk = escape_html(str(position.get("pubkey") or "?"))
+    return (
+        f"📤 <b>Вынуть {pct:d}% — проверьте перед подтверждением</b>\n"
+        f"Позиция <code>{pk}</code> · сейчас ≈ ${total_usd:.2f}\n\n"
+        f"Выйдет: {out_sol:.6f} SOL (~${out_sol * usdc_per_sol:.2f}) + "
+        f"{out_usdc:.4f} USDC ≈ ${out_usd:.2f}\n"
+        f"Останется в позиции: {left_sol:.6f} SOL + {left_usdc:.4f} USDC "
+        f"≈ ${left_usd:.2f}\n\n"
+        "Позиция не закрывается. Рента за аккаунт остаётся запертой, "
+        "пока позиция жива. Деньги — в кошелёк бота.\n\n"
+        f"Подтвердить: <code>/withdraw {pct:d} confirm</code>"
+    )
+
+
+def claim_fees(
+    position: dict,
+    *,
+    reply: Callable[[str], Any],
+) -> dict:
+    """Claim swap fees into the bot wallet; leave the position open."""
+    if fees_are_zero(position):
+        reply("❌ Комиссий нет — транзакцию не отправляю.")
+        raise RuntimeError("claim_fees: zero fees")
+    pk = position["pubkey"]
+    reply("💸 Забираю комиссии…")
+    payload = meteora_exec.exec_claim_fees(owner(), pk, **exec_kwargs())
+    assert_exec_fully_confirmed(payload)
+    reply(format_exec_replies(payload))
+    return payload
+
+
+def withdraw_partial(
+    position: dict,
+    pct: int,
+    *,
+    reply: Callable[[str], Any],
+) -> dict:
+    """Remove ``pct``% liquidity (1..99). Does not close the position account."""
+    pct_i = int(pct)
+    if not (1 <= pct_i <= 99):
+        raise ValueError("withdraw_partial: pct must be 1..99")
+    bps = pct_i * 100
+    pk = position["pubkey"]
+    reply(f"📤 Вынимаю {pct_i}% ликвидности…")
+    payload = meteora_exec.exec_withdraw(owner(), pk, bps, **exec_kwargs())
+    assert_exec_fully_confirmed(payload)
+    reply(format_exec_replies(payload))
+    return payload
+
+
 def close_position_full(
     position: dict,
     *,

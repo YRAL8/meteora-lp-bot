@@ -44,7 +44,7 @@ log = logging.getLogger(__name__)
 # Emergency /withdraw waits this long for money_lock (C12).
 WITHDRAW_LOCK_WAIT_SEC = 600.0
 
-# Exactly Orca's owner command set (no /close, no /swap as Telegram commands).
+# Owner command set: Orca ten + claim (fees without closing).
 _OWNER_COMMANDS = (
     "status",
     "pnl",
@@ -52,25 +52,26 @@ _OWNER_COMMANDS = (
     "rebalance",
     "addliquidity",
     "open",
+    "claim",
     "pauza",
     "stop",
     "boevoy",
     "withdraw",
 )
 
-# Same order and labels as orca_bot/telegram_bot.py _MENU_COMMANDS.
-# /start and keyboard help are NOT part of this ten-command menu.
+# Menu: Orca order with claim after open (fees without closing the position).
 _MENU_COMMANDS = [
     BotCommand("status", "Статус позиции и баланс"),
     BotCommand("pnl", "PnL по циклам (журнал)"),
     BotCommand("rebalance", "Ребаланс прямо сейчас"),
     BotCommand("addliquidity", "Долить ликвидность (нужна сумма)"),
     BotCommand("open", "Смета и открытие позиции (сумма, confirm)"),
+    BotCommand("claim", "Забрать комиссии (без закрытия)"),
     BotCommand("setrange", "Изменить ширину диапазона (нужен %)"),
     BotCommand("pauza", "Пауза автоматики"),
     BotCommand("stop", "Полная заморозка"),
     BotCommand("boevoy", "Снять паузу и заморозку"),
-    BotCommand("withdraw", "Закрыть позицию (нужно подтверждение)"),
+    BotCommand("withdraw", "Вынуть долю или закрыть (confirm)"),
 ]
 
 _EFF_SIDEWAYS_MAX = 0.3
@@ -888,9 +889,225 @@ async def addliquidity_command(
             await _reply(update, f"❌ Ошибка: {e}")
 
 
+async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Claim fees into the bot wallet; never closes the position."""
+    if bot_state.bot_frozen:
+        await _reply(update, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
+        return
+    if bot_state.money_lock.locked():
+        await _reply(update, "⏳ Идёт ребаланс/открытие — подожди.")
+        return
+
+    args = list(context.args or [])
+    confirm = False
+    if args and args[-1].lower() == "confirm":
+        confirm = True
+        args = args[:-1]
+    if any(a.lower() == "confirm" for a in args):
+        await _reply(
+            update,
+            "❌ confirm должен быть последним словом: /claim confirm",
+            parse_mode="HTML",
+        )
+        return
+    if args:
+        await _reply(
+            update,
+            "Использование: /claim   или   /claim confirm",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        position = money_ops.get_primary_position()
+    except Exception as e:
+        await _reply(update, f"❌ Не удалось загрузить позицию: {escape_html(e)}", parse_mode="HTML")
+        return
+    if position is None:
+        await _reply(update, "❌ Открытой позиции нет — комиссий забирать неоткуда.")
+        return
+
+    pool = meteora_ops.pool_info(**money_ops.ops_kwargs())
+    price = float(pool.get("usdcPerSol") or 0)
+
+    if not confirm:
+        text = money_ops.format_claim_estimate(position, price)
+        await _reply(update, text, parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    if money_ops.fees_are_zero(position):
+        await _reply(
+            update,
+            "❌ Комиссий нет — транзакцию не отправляю.",
+        )
+        return
+
+    async with bot_state.money_lock:
+        replies: list[str] = []
+        collector = _reply_sync_collector(replies)
+
+        async def flush() -> None:
+            for r in replies:
+                await _reply(update, r, parse_mode="HTML", disable_web_page_preview=True)
+            replies.clear()
+
+        try:
+            await _run_money(money_ops.claim_fees, position, reply=collector)
+            await flush()
+        except MeteoraExecError as e:
+            await flush()
+            if await _handle_journal_block(update, e):
+                return
+            await _reply(update, f"❌ {escape_html(e)}", parse_mode="HTML")
+        except Exception as e:
+            log.exception("/claim failed")
+            await flush()
+            if await _handle_journal_block(update, e):
+                return
+            await _reply(update, f"❌ Ошибка: {escape_html(e)}", parse_mode="HTML")
+
+
+def _parse_withdraw_args(
+    args: list[str],
+) -> tuple[str, int | None, bool, str | None]:
+    """Parse /withdraw → (kind, pct|None, confirm, error).
+
+    kind: ``full`` | ``partial``
+    Grammar mirrors ``_parse_open_args``: ``confirm`` only as the last token.
+    """
+    if not args:
+        return "full", None, False, None
+
+    tokens = list(args)
+    confirm = False
+    if tokens and tokens[-1].lower() == "confirm":
+        confirm = True
+        tokens = tokens[:-1]
+    if any(t.lower() == "confirm" for t in tokens):
+        return (
+            "full",
+            None,
+            False,
+            "❌ confirm должен быть последним словом:\n"
+            "/withdraw confirm   или   /withdraw &lt;1..99&gt; confirm",
+        )
+
+    if not tokens:
+        # /withdraw confirm
+        return "full", None, confirm, None
+
+    if len(tokens) != 1:
+        return (
+            "full",
+            None,
+            False,
+            "❌ Слишком много аргументов.\n"
+            "Частичный: /withdraw &lt;1..99&gt; [confirm]\n"
+            "Полное закрытие: /withdraw confirm",
+        )
+
+    raw = tokens[0]
+    # Integers only — reject 25.5, -5, abc, 01 is ok as digit string → 1? 
+    # "01".isdigit() True → int 1 — acceptable.
+    if not raw.isdigit():
+        return (
+            "full",
+            None,
+            False,
+            "❌ Нужен целый процент 1..99, например: /withdraw 25\n"
+            "Полное закрытие: /withdraw confirm",
+        )
+    pct = int(raw)
+    if pct == 100:
+        return (
+            "full",
+            None,
+            False,
+            "❌ 100% так не вынимают: останется пустая позиция с запертой рентой.\n"
+            "Полное закрытие с возвратом ренты: /withdraw confirm",
+        )
+    if not (1 <= pct <= 99):
+        return (
+            "full",
+            None,
+            False,
+            "❌ Процент частичного вывода — целое число от 1 до 99.",
+        )
+    return "partial", pct, confirm, None
+
+
 async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Full close with confirm. Works even under /stop (emergency exit, like Orca)."""
-    confirmed = bool(context.args) and context.args[0].lower() == "confirm"
+    """Partial withdraw (1..99%) or full close (/withdraw confirm).
+
+    Full close remains the emergency exit and works under /stop.
+    Partial withdraw and its estimate refuse when frozen.
+    """
+    kind, pct, confirm, err = _parse_withdraw_args(list(context.args or []))
+    if err is not None:
+        await _reply(update, err, parse_mode="HTML")
+        return
+
+    if kind == "partial":
+        # Not emergency — same guards as /open and /claim.
+        if bot_state.bot_frozen:
+            await _reply(update, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
+            return
+        if bot_state.money_lock.locked():
+            await _reply(update, "⏳ Идёт ребаланс/открытие — подожди.")
+            return
+        assert pct is not None
+        try:
+            position = money_ops.get_primary_position()
+        except Exception as e:
+            await _reply(
+                update,
+                f"❌ Не удалось загрузить позицию: {escape_html(e)}",
+                parse_mode="HTML",
+            )
+            return
+        if position is None:
+            await _reply(update, "❌ Открытой позиции нет — вынимать нечего.")
+            return
+        pool = meteora_ops.pool_info(**money_ops.ops_kwargs())
+        price = float(pool.get("usdcPerSol") or 0)
+        if not confirm:
+            text = money_ops.format_partial_withdraw_estimate(position, pct, price)
+            await _reply(
+                update, text, parse_mode="HTML", disable_web_page_preview=True
+            )
+            return
+        async with bot_state.money_lock:
+            replies: list[str] = []
+            collector = _reply_sync_collector(replies)
+
+            async def flush_partial() -> None:
+                for r in replies:
+                    await _reply(
+                        update, r, parse_mode="HTML", disable_web_page_preview=True
+                    )
+                replies.clear()
+
+            try:
+                await _run_money(
+                    money_ops.withdraw_partial, position, pct, reply=collector
+                )
+                await flush_partial()
+            except MeteoraExecError as e:
+                await flush_partial()
+                if await _handle_journal_block(update, e):
+                    return
+                await _reply(update, f"❌ {escape_html(e)}", parse_mode="HTML")
+            except Exception as e:
+                log.exception("/withdraw partial failed")
+                await flush_partial()
+                if await _handle_journal_block(update, e):
+                    return
+                await _reply(
+                    update, f"❌ Ошибка: {escape_html(e)}", parse_mode="HTML"
+                )
+        return
+
+    # ---- full close (emergency) — unchanged behaviour ----
     try:
         position = money_ops.get_primary_position()
     except Exception as e:
@@ -903,13 +1120,14 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     pool = meteora_ops.pool_info(**money_ops.ops_kwargs())
     price = float(pool.get("usdcPerSol") or 0)
     val = money_ops.position_value_usd(position, price)
-    if not confirmed:
+    if not confirm:
         await _reply(
             update,
             f"⚠️ <b>Закрыть позицию:</b> ${val:.2f}\n"
             f"bins [{position['lowerBinId']},{position['upperBinId']}]\n\n"
             f"Деньги останутся в кошельке бота — никуда отдельно не переводятся.\n"
-            f"Подтвердить: /withdraw confirm",
+            f"Частичный вывод: /withdraw &lt;1..99&gt;\n"
+            f"Подтвердить полное закрытие: <code>/withdraw confirm</code>",
             parse_mode="HTML",
         )
         return
@@ -1389,6 +1607,7 @@ def build_telegram_app() -> Application:
         ("rebalance", rebalance_command),
         ("addliquidity", addliquidity_command),
         ("open", open_command),
+        ("claim", claim_command),
         ("pauza", pauza_command),
         ("stop", stop_command),
         ("boevoy", boevoy_command),
