@@ -405,6 +405,222 @@ def suggest_for_budget(
     )
 
 
+# Typical rent-exempt for a new SPL token account when balances.ata.*.rentLamports
+# is null (account does not exist yet). Not a money-path change — display only.
+_MISSING_ATA_RENT_SOL = 0.00203928
+
+
+def _missing_ata_rent_sol(bal: dict) -> tuple[float, list[str]]:
+    """SOL rent still needed for USDC/WSOL ATAs that do not exist yet."""
+    ata = bal.get("ata") or {}
+    missing: list[str] = []
+    total = 0.0
+    for key, label in (("usdc", "USDC"), ("wsol", "WSOL")):
+        info = ata.get(key) or {}
+        if info.get("exists"):
+            continue
+        lamports = info.get("rentLamports")
+        if lamports is not None:
+            sol = float(lamports) / 1e9
+        else:
+            sol = _MISSING_ATA_RENT_SOL
+        total += sol
+        missing.append(label)
+    return total, missing
+
+
+def _funding_shortfalls_after_swap(
+    *,
+    need_sol: float,
+    need_usdc: float,
+    usable_sol: float,
+    usdc_have: float,
+    price: float,
+    swap_suggestion: dict | None,
+) -> list[str]:
+    """Human fragments: how much SOL / USDC is still missing after the planned swap."""
+    sol = float(usable_sol)
+    usdc = float(usdc_have)
+    if swap_suggestion and price > 0:
+        side = swap_suggestion.get("side")
+        amt = float(swap_suggestion.get("amount") or 0)
+        if side == "usdc-to-sol" and amt > 0:
+            usdc -= amt
+            sol += amt / price
+        elif side == "sol-to-usdc" and amt > 0:
+            sol -= amt
+            usdc += amt * price
+    parts: list[str] = []
+    if sol + 1e-9 < need_sol:
+        d = need_sol - sol
+        parts.append(f"{d:.4f} SOL (~${d * price:.2f})")
+    if usdc + 1e-6 < need_usdc:
+        d = need_usdc - usdc
+        parts.append(f"${d:.2f} USDC")
+    return parts
+
+
+def format_swap_line(swap_suggestion: dict | None) -> str | None:
+    """Human line for the swapSuggestion from suggest-amounts (no invented math)."""
+    if not swap_suggestion:
+        return None
+    side = swap_suggestion.get("side")
+    amount = float(swap_suggestion.get("amount") or 0)
+    if not side or amount <= 0:
+        return None
+    if side == "usdc-to-sol":
+        return f"Нужен обмен: {amount:.2f} USDC → SOL"
+    if side == "sol-to-usdc":
+        return f"Нужен обмен: {amount:.6f} SOL → USDC"
+    return f"Нужен обмен: {side} {amount}"
+
+
+def build_open_estimate(
+    requested_usd: float,
+    *,
+    width_pct: float | None = None,
+) -> str:
+    """Read-only open quote for Telegram. Never signs or sends.
+
+    ``width_pct`` is a one-shot override from the command line; when None, uses
+    the saved /setrange setting. Does not mutate ``range_state``.
+    """
+    pool = meteora_ops.pool_info(**ops_kwargs())
+    bal = meteora_ops.balances(owner(), **ops_kwargs())
+    bin_step = int(pool["binStep"])
+    max_bins = int(pool["maxBinsPerPosition"])
+    active_id = int(pool["activeId"])
+    price = float(pool.get("usdcPerSol") or 0)
+
+    if width_pct is not None:
+        half = range_state.half_width_for_pct(
+            float(width_pct), bin_step, max_bins_per_position=max_bins
+        )
+        pct_display = float(width_pct)
+        width_source = "из команды (настройка не менялась)"
+    else:
+        half = range_state.current_half_width()
+        pct_display = range_state.current_range_pct()
+        width_source = "из настройки /setrange"
+
+    lo = active_id - half
+    hi = active_id + half
+    width_bins = hi - lo + 1
+    lo_p, hi_p = bin_prices(active_id, price, bin_step, lo, hi)
+
+    notes: list[str] = []
+
+    def note(text: str) -> None:
+        notes.append(text)
+
+    budget = apply_max_position_cap(
+        float(requested_usd), reply=note, action="смета"
+    )
+    # Cap message from apply_max_position_cap is already in notes.
+
+    # Position rent is quoted for the default ordinary open
+    # (positionRentForDefaultOpen.binCount, typically 69 = 2*DEFAULT_RANGE_HALF+1),
+    # not for the requested width. Correct while the bot only opens ordinary
+    # positions. When extended positions land, this estimate line will understate
+    # rent for wider ranges — recompute from the actual bin count then.
+    rent_info = bal.get("positionRentForDefaultOpen") or {}
+    rent_sol = float(rent_info.get("sol") or 0)
+    fee_sol = float(bal.get("feeReserveSol") or FEE_RESERVE_SOL)
+    ata_rent_sol, ata_missing = _missing_ata_rent_sol(bal)
+
+    sol_have = float((bal.get("sol") or {}).get("ui") or 0)
+    usdc_have = float((bal.get("usdc") or {}).get("ui") or 0)
+    sao = bal.get("solAvailableForOpen")
+    usable_sol = (
+        max(0.0, float(sao))
+        if sao is not None
+        else max(0.0, sol_have - fee_sol - rent_sol)
+    )
+    wallet_usd = sol_have * price + usdc_have
+
+    suggestion = suggest_for_budget(budget, half_width=half)
+    need_sol = float(suggestion.get("needSol") or 0)
+    need_usdc = float(suggestion.get("needUsdc") or 0)
+    swap_sug = suggestion.get("swapSuggestion")
+    # Prefer price from suggest-amounts params when present (same RPC snapshot).
+    params = suggestion.get("params") or {}
+    if params.get("usdcPerSol"):
+        price = float(params["usdcPerSol"])
+        wallet_usd = sol_have * price + usdc_have
+        lo_p, hi_p = bin_prices(active_id, price, bin_step, lo, hi)
+
+    rent_usd = rent_sol * price
+    fee_usd = fee_sol * price
+    ata_usd = ata_rent_sol * price
+    locked_usd = rent_usd + fee_usd + ata_usd
+    free_after = wallet_usd - budget - locked_usd
+
+    shortfalls = _funding_shortfalls_after_swap(
+        need_sol=need_sol,
+        need_usdc=need_usdc,
+        usable_sol=usable_sol,
+        usdc_have=usdc_have,
+        price=price,
+        swap_suggestion=swap_sug if isinstance(swap_sug, dict) else None,
+    )
+
+    lines: list[str] = [
+        "🆕 <b>Открытие позиции — проверьте перед подтверждением</b>",
+        "",
+        f"Кошелёк: {sol_have:.4f} SOL + {usdc_have:.2f} USDC  "
+        f"(всего ${wallet_usd:.2f})",
+        "",
+        f"Диапазон: ±{pct_display:g}% — от ${lo_p:.2f} до ${hi_p:.2f}",
+        f"          (сейчас ${price:.2f}, {width_bins} ячеек,",
+        f"          ширина {width_source})",
+        "",
+        "Куда уйдут деньги:",
+        f"  • в пул          ${budget:.2f}   работает",
+        f"  • залог          {rent_sol:.4f} SOL = ${rent_usd:.2f}   "
+        f"вернётся при закрытии",
+    ]
+    if ata_missing:
+        labels = " + ".join(ata_missing)
+        lines.append(
+            f"  • залог ATA ({labels})  {ata_rent_sol:.4f} SOL = ${ata_usd:.2f}   "
+            f"вернётся при закрытии счетов"
+        )
+    lines.append(
+        f"  • на комиссии    {fee_sol:.4f} SOL = ${fee_usd:.2f}   "
+        f"тратится по копейке"
+    )
+    lines.append(f"  • свободно после ${free_after:.2f}")
+    lines.append("")
+
+    for n in notes:
+        # Cap announcements use raw "$" — fine in HTML; escape any stray angles.
+        lines.append(escape_html(n))
+
+    swap_line = format_swap_line(swap_sug if isinstance(swap_sug, dict) else None)
+    if swap_line:
+        lines.append(swap_line)
+    else:
+        lines.append("Обмен не нужен — пропорция уже на кошельке.")
+
+    if shortfalls:
+        lines.append("")
+        lines.append(
+            "❌ Не хватает средств на депозит (после запланированного обмена): "
+            + " и ".join(shortfalls)
+            + ". Дошли и снова /open — смета ничего не отправляет."
+        )
+    else:
+        # Confirm command must repeat the same amount and optional width.
+        if width_pct is not None:
+            confirm_cmd = f"/open {requested_usd:g} {width_pct:g} confirm"
+        else:
+            confirm_cmd = f"/open {requested_usd:g} confirm"
+        lines.append("")
+        lines.append(f"Подтвердить: <code>{escape_html(confirm_cmd)}</code>")
+
+    return "\n".join(lines)
+
+
 def _scale_legs_to_wallet(
     need_sol: float, need_usdc: float, usable_sol: float, usdc_have: float
 ) -> tuple[float, float, float]:

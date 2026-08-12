@@ -64,7 +64,7 @@ _MENU_COMMANDS = [
     BotCommand("pnl", "PnL по циклам (журнал)"),
     BotCommand("rebalance", "Ребаланс прямо сейчас"),
     BotCommand("addliquidity", "Долить ликвидность (нужна сумма)"),
-    BotCommand("open", "Открыть новую позицию (нужна сумма)"),
+    BotCommand("open", "Смета и открытие позиции (сумма, confirm)"),
     BotCommand("setrange", "Изменить ширину диапазона (нужен %)"),
     BotCommand("pauza", "Пауза автоматики"),
     BotCommand("stop", "Полная заморозка"),
@@ -593,6 +593,70 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _reply(update, f"❌ Ошибка /setrange: {e}")
 
 
+def _parse_open_args(
+    args: list[str],
+) -> tuple[float | None, float | None, bool, str | None]:
+    """Parse /open tokens → (amount, width_pct|None, confirm, error).
+
+    Grammar: ``/open <amount> [width%] [confirm]`` with ``confirm`` only last.
+    """
+    if not args:
+        return (
+            None,
+            None,
+            False,
+            "Использование: /open &lt;сумма USDC&gt; [ширина%] [confirm]\n"
+            "Смета: /open 10   или   /open 10 0.8\n"
+            "Открытие: /open 10 confirm   или   /open 10 0.8 confirm",
+        )
+    tokens = list(args)
+    confirm = False
+    if tokens and tokens[-1].lower() == "confirm":
+        confirm = True
+        tokens = tokens[:-1]
+    if any(t.lower() == "confirm" for t in tokens):
+        return (
+            None,
+            None,
+            False,
+            "❌ confirm должен быть последним словом: "
+            "/open &lt;сумма&gt; [ширина%] confirm",
+        )
+    if not tokens:
+        return None, None, False, "❌ После confirm нужна сумма: /open 10 confirm"
+    try:
+        amount = float(tokens[0])
+    except ValueError:
+        return None, None, False, "❌ Нужно число, например: /open 5"
+    if amount <= 0:
+        return None, None, False, "❌ Сумма должна быть больше 0."
+    width_pct: float | None = None
+    if len(tokens) == 1:
+        pass
+    elif len(tokens) == 2:
+        try:
+            width_pct = float(tokens[1])
+        except ValueError:
+            return None, None, False, "❌ Ширина — число процентов, например: /open 10 0.8"
+        if not (range_state.MIN_RANGE_PCT <= width_pct <= range_state.MAX_RANGE_PCT):
+            return (
+                None,
+                None,
+                False,
+                f"❌ Ширина должна быть от {range_state.MIN_RANGE_PCT} до "
+                f"{range_state.MAX_RANGE_PCT} (включительно).",
+            )
+    else:
+        return (
+            None,
+            None,
+            False,
+            "❌ Слишком много аргументов.\n"
+            "Нужно: /open &lt;сумма&gt; [ширина%] [confirm]",
+        )
+    return amount, width_pct, confirm, None
+
+
 async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if bot_state.bot_frozen:
         await _reply(update, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
@@ -600,22 +664,52 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if bot_state.money_lock.locked():
         await _reply(update, "⏳ Идёт ребаланс/открытие — подожди.")
         return
-    if not context.args:
-        await _reply(
-            update,
-            "Использование: /open &lt;сумма USDC&gt;\nПример: /open 5",
-            parse_mode="HTML",
-        )
+
+    amount, width_pct, confirm, err = _parse_open_args(list(context.args or []))
+    if err is not None:
+        await _reply(update, err, parse_mode="HTML")
         return
-    try:
-        usdc_amount = float(context.args[0])
-    except ValueError:
-        await _reply(update, "❌ Нужно число, например: /open 5")
-        return
-    if usdc_amount <= 0:
-        await _reply(update, "❌ Сумма должна быть больше 0.")
+    assert amount is not None
+
+    # Estimate: read-only, no money_lock hold (early locked() guard above).
+    if not confirm:
+        existing = money_ops.get_primary_position()
+        if existing is not None:
+            price = float(
+                meteora_ops.pool_info(**money_ops.ops_kwargs()).get("usdcPerSol") or 0
+            )
+            val = money_ops.position_value_usd(existing, price)
+            await _reply(
+                update,
+                f"❌ Позиция уже открыта (${val:.2f}) — "
+                "используй /rebalance или /addliquidity, а не /open.",
+            )
+            return
+        try:
+            text = await _run_money(
+                money_ops.build_open_estimate,
+                amount,
+                width_pct=width_pct,
+            )
+            await _reply(
+                update, text, parse_mode="HTML", disable_web_page_preview=True
+            )
+        except range_state.RangeTooWideError as e:
+            await _reply(
+                update,
+                f"❌ Запрошено ±{e.requested_pct}% — больше максимума "
+                f"±{e.max_pct:.4f}% на этом пуле (binStep={e.bin_step}).\n"
+                f"Одна обычная позиция вмещает не больше {e.max_bins_per_position} "
+                f"ячеек (half ≤ {e.max_half_width}).\n"
+                "Смета не построена, настройка /setrange не менялась.",
+            )
+        except Exception as e:
+            log.exception("/open estimate failed")
+            await _reply(update, f"❌ Ошибка сметы: {escape_html(e)}", parse_mode="HTML")
         return
 
+    # Confirm: same width resolution as the estimate (command line, not silent
+    # fall-back to a different saved width when the user typed one).
     async with bot_state.money_lock:
         existing = money_ops.get_primary_position()
         if existing is not None:
@@ -637,11 +731,41 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await _reply(update, r, parse_mode="HTML", disable_web_page_preview=True)
             replies.clear()
 
+        half_for_open: int | None = None
         try:
-            collector(f"🆕 Открываю новую позицию на ${usdc_amount:.2f} USDC…")
+            if width_pct is not None:
+                pool = await _run_money(
+                    meteora_ops.pool_info, **money_ops.ops_kwargs()
+                )
+                half_for_open = range_state.half_width_for_pct(
+                    float(width_pct),
+                    int(pool["binStep"]),
+                    max_bins_per_position=int(pool["maxBinsPerPosition"]),
+                )
+            collector(
+                f"🆕 Открываю новую позицию на ${amount:.2f} USDC"
+                + (
+                    f" (ширина ±{width_pct:g}% из команды)"
+                    if width_pct is not None
+                    else ""
+                )
+                + "…"
+            )
             await flush()
-            await _run_money(money_ops.open_with_budget, usdc_amount, reply=collector)
+            await _run_money(
+                money_ops.open_with_budget,
+                amount,
+                half_width=half_for_open,
+                reply=collector,
+            )
             await flush()
+        except range_state.RangeTooWideError as e:
+            await flush()
+            await _reply(
+                update,
+                f"❌ Запрошено ±{e.requested_pct}% — больше максимума "
+                f"±{e.max_pct:.4f}% на этом пуле. Не открываю.",
+            )
         except SwapFailedOpenAborted as e:
             await flush()
             await _reply(update, f"❌ Открытие отменено: {e}")

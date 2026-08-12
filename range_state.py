@@ -94,14 +94,14 @@ def pct_to_half_width_bins(pct: float, bin_step: int) -> int:
     return max(1, half)
 
 
-def apply_setrange(
+def half_width_for_pct(
     pct: float, bin_step: int, *, max_bins_per_position: int
 ) -> int:
-    """Update runtime state from /setrange; returns new half_width_bins.
+    """Convert percent → half_width_bins with the same refusals as /setrange.
 
-    Refuses (no silent clamp) when pct exceeds what one position can hold.
+    Does **not** mutate runtime state — used by /open [width] so a one-shot
+    width in the command never sticks in range_state.
     """
-    global range_width_pct, half_width_bins
     if not (MIN_RANGE_PCT <= pct <= MAX_RANGE_PCT):
         raise ValueError(f"pct must be in {MIN_RANGE_PCT}..{MAX_RANGE_PCT}")
     max_pct = max_pct_for_pool(bin_step, max_bins_per_position)
@@ -124,6 +124,20 @@ def apply_setrange(
             max_bins_per_position=max_bins_per_position,
             bin_step=bin_step,
         )
+    return half
+
+
+def apply_setrange(
+    pct: float, bin_step: int, *, max_bins_per_position: int
+) -> int:
+    """Update runtime state from /setrange; returns new half_width_bins.
+
+    Refuses (no silent clamp) when pct exceeds what one position can hold.
+    """
+    global range_width_pct, half_width_bins
+    half = half_width_for_pct(
+        pct, bin_step, max_bins_per_position=max_bins_per_position
+    )
     range_width_pct = float(pct)
     half_width_bins = half
     return half
