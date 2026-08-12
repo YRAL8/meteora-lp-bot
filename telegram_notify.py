@@ -1,6 +1,8 @@
 import html
 import logging
 from collections import deque
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -20,6 +22,26 @@ price_history: deque[float] = deque(maxlen=12)
 def escape_html(text: object) -> str:
     """Экранировать внешний текст для parse_mode=HTML (<, >, &)."""
     return html.escape(str(text), quote=False)
+
+
+def format_stamp(now: datetime | None = None) -> str:
+    """Дата и время для человека: местное, плюс UTC — журнал ведётся в UTC.
+
+    Telegram показывает рядом с сообщением только часы, а день приходится
+    угадывать по разделителю в ленте. Сердцебиение приходит и ночью, и через
+    сутки молчания — из «12:59» не понять, какого оно числа.
+    """
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    try:
+        local = now.astimezone(ZoneInfo(bot_config.DISPLAY_TIMEZONE))
+    except Exception:
+        # Нет tzdata в образе или опечатка в поясе — показываем UTC, но никогда
+        # не молчим и не падаем: отметка времени не стоит потерянного сообщения.
+        return now.strftime("%d.%m.%Y %H:%M UTC")
+    return f"{local:%d.%m.%Y %H:%M %Z} · {now:%H:%M} UTC"
 
 
 def format_html_error(prefix: str, err: object) -> str:

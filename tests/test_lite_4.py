@@ -258,5 +258,69 @@ class HeartbeatHtmlSafetyTests(unittest.TestCase):
         )
 
 
+class StampTests(unittest.TestCase):
+    """Дата в сообщениях: Telegram показывает только часы, день теряется."""
+
+    def test_local_and_utc_with_date(self) -> None:
+        import bot_config
+        from telegram_notify import format_stamp
+
+        # Летом Берлин = UTC+2, значит 10:39 UTC → 12:39 местного.
+        now = datetime(2026, 8, 12, 10, 39, tzinfo=timezone.utc)
+        with patch.object(bot_config, "DISPLAY_TIMEZONE", "Europe/Berlin"):
+            s = format_stamp(now)
+        self.assertIn("12.08.2026", s)
+        self.assertIn("12:39", s)
+        self.assertIn("10:39", s)
+        self.assertIn("UTC", s)
+
+    def test_naive_datetime_treated_as_utc(self) -> None:
+        import bot_config
+        from telegram_notify import format_stamp
+
+        with patch.object(bot_config, "DISPLAY_TIMEZONE", "Europe/Berlin"):
+            s = format_stamp(datetime(2026, 8, 12, 10, 39))
+        self.assertIn("12:39", s)
+
+    def test_broken_timezone_falls_back_to_utc(self) -> None:
+        """Нет tzdata или опечатка в поясе — отметка не стоит потерянного сообщения."""
+        import bot_config
+        from telegram_notify import format_stamp
+
+        now = datetime(2026, 8, 12, 10, 39, tzinfo=timezone.utc)
+        with patch.object(bot_config, "DISPLAY_TIMEZONE", "Nowhere/Nothing"):
+            s = format_stamp(now)
+        self.assertEqual(s, "12.08.2026 10:39 UTC")
+
+    def test_heartbeat_carries_the_date(self) -> None:
+        import bot_config
+        import bot_state
+        import main as main_mod
+
+        main_mod.reset_heartbeat_snapshot_for_tests()
+        main_mod.reset_storm_guards_for_tests()
+        bot_state.bot_paused = False
+        bot_state.bot_frozen = False
+        now = datetime(2026, 8, 12, 10, 39, tzinfo=timezone.utc)
+
+        with (
+            patch.object(bot_config, "AUTO_REBALANCE", True),
+            patch.object(bot_config, "DRY_RUN", False),
+            patch.object(bot_config, "DISPLAY_TIMEZONE", "Europe/Berlin"),
+            patch.object(bot_config, "effective_network", return_value="mainnet"),
+            patch("main.bot_config.wallet_pubkey", return_value="Owner"),
+            patch("main.money_ops.ops_kwargs", return_value={}),
+            patch("main.meteora_ops.balances", return_value=_bal()),
+            patch("main.meteora_ops.pool_info", return_value=_pool()),
+            patch("main.money_ops.get_primary_position", return_value=None),
+            patch("main.is_reopen_pending", return_value=False),
+            patch("meteora_exec.list_unresolved_journal", return_value=[]),
+        ):
+            text = main_mod.format_heartbeat(now=now)
+
+        self.assertIn("12.08.2026", text)
+        self.assertIsNone(_find_bad_angle(text))
+
+
 if __name__ == "__main__":
     unittest.main()

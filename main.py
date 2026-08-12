@@ -21,6 +21,7 @@ from telegram_notify import (
     format_position_table,
     format_price_trend,
     format_range_bar,
+    format_stamp,
     position_in_range,
     send_telegram_message,
 )
@@ -180,7 +181,10 @@ def format_heartbeat(*, now: datetime | None = None) -> str:
 
     mode = "DEMO" if bot_config.DRY_RUN else "БОЕВОЙ"
     net = bot_config.effective_network()
-    lines = [f"💓 <b>Сердцебиение [{mode}]</b> · {escape_html(net)}"]
+    lines = [
+        f"💓 <b>Сердцебиение [{mode}]</b> · {escape_html(net)}",
+        format_stamp(now),
+    ]
 
     usable_sol: Optional[float] = None
     read_ok = False

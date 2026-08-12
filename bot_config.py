@@ -72,6 +72,10 @@ if HEARTBEAT_INTERVAL_HOURS < 0:
 
 MIN_SOL_BALANCE = float(os.getenv("MIN_SOL_BALANCE", "0.08"))
 
+# Часовой пояс для отметок времени в сообщениях. Внутри бот целиком на UTC
+# (журнал, суточные лимиты) — этот пояс только для чтения человеком.
+DISPLAY_TIMEZONE = os.getenv("DISPLAY_TIMEZONE", "Europe/Berlin")
+
 # Opt-in when build-add returns >1 tx (C11b). Default off — one-tx adds work
 # without this flag. Late chunks re-sign with a fresh blockhash (C11).
 ALLOW_MULTI_TX_ADD = _env_bool("ALLOW_MULTI_TX_ADD", "false")

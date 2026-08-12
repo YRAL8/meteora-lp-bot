@@ -33,6 +33,7 @@ from telegram_notify import (
     format_position_table,
     format_price_trend,
     format_range_bar,
+    format_stamp,
     position_in_range,
     short_addr,
 )
@@ -200,7 +201,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Порядок строк как в /status боевого orca-lp-bot: заголовок -> позиция ->
         # цена -> диапазон -> статус -> балансы. Технические подробности (адреса,
         # ячейки, binStep) уходят одной сноской в конец, чтобы не забивать экран.
-        lines = [f"📊 <b>Статус [{mode}]</b>"]
+        lines = [f"📊 <b>Статус [{mode}]</b> · {format_stamp()}"]
 
         if is_reopen_pending():
             lines.append("⚠️ <b>Ребаланс оборвался</b> между закрытием и открытием!")
