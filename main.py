@@ -285,7 +285,7 @@ def format_heartbeat(*, now: datetime | None = None) -> str:
     if reasons:
         lines.append("⏸ <b>Автоматика стоит:</b>")
         for r in reasons:
-            lines.append(f"• {r}")
+            lines.append(f"• {escape_html(r)}")
     else:
         lines.append("✅ Авто-ребаланс готов действовать при выходе из диапазона.")
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -193,6 +194,68 @@ class HeartbeatDoesNotKillMonitorTests(unittest.IsolatedAsyncioTestCase):
                 now=datetime(2026, 8, 10, 16, 0, tzinfo=timezone.utc)
             )
         self.assertIsNotNone(main_mod._last_monitor_tick_at)
+
+
+_TELEGRAM_TAGS = {
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+    "a", "code", "pre", "span", "tg-spoiler", "blockquote",
+}
+_TAG_RE = re.compile(r"</?([a-zA-Z][a-zA-Z0-9-]*)(?:\s[^<>]*)?>")
+
+
+def _find_bad_angle(text: str) -> str | None:
+    """Первый '<', который Telegram не примет как тег. None — текст разберётся."""
+    pos = 0
+    while True:
+        i = text.find("<", pos)
+        if i == -1:
+            return None
+        m = _TAG_RE.match(text, i)
+        if m is None or m.group(1).lower() not in _TELEGRAM_TAGS:
+            return text[i : i + 24]
+        pos = m.end()
+
+
+class HeartbeatHtmlSafetyTests(unittest.TestCase):
+    """Причина с '<' роняла всё сообщение: бот молчал именно когда мало SOL."""
+
+    def test_checker_catches_raw_angle(self) -> None:
+        # Проверка самой проверки: без неё тест ниже мог бы пройти впустую.
+        self.assertIsNone(_find_bad_angle("<b>ok</b> и <code>x</code>"))
+        self.assertIsNotNone(_find_bad_angle("доступно 0.0494 < 0.05"))
+
+    def test_low_sol_reason_does_not_break_html(self) -> None:
+        import bot_config
+        import bot_state
+        import main as main_mod
+
+        main_mod.reset_heartbeat_snapshot_for_tests()
+        main_mod.reset_storm_guards_for_tests()
+        bot_state.bot_paused = False
+        bot_state.bot_frozen = False
+        now = datetime(2026, 8, 12, 9, 0, tzinfo=timezone.utc)
+
+        with (
+            patch.object(bot_config, "AUTO_REBALANCE", True),
+            patch.object(bot_config, "DRY_RUN", False),
+            patch.object(bot_config, "MIN_SOL_BALANCE", 0.05),
+            patch.object(bot_config, "effective_network", return_value="mainnet"),
+            patch("main.bot_config.wallet_pubkey", return_value="Owner"),
+            patch("main.money_ops.ops_kwargs", return_value={}),
+            patch("main.meteora_ops.balances", return_value=_bal(sol=0.1294)),
+            patch("main.meteora_ops.pool_info", return_value=_pool()),
+            patch("main.money_ops.get_primary_position", return_value=None),
+            patch("main.is_reopen_pending", return_value=False),
+            patch("meteora_exec.list_unresolved_journal", return_value=[]),
+        ):
+            text = main_mod.format_heartbeat(now=now)
+
+        # Ветка действительно та: причина про нехватку SOL в тексте есть.
+        self.assertIn("мало SOL", text)
+        bad = _find_bad_angle(text)
+        self.assertIsNone(
+            bad, f"Telegram отвергнет сообщение целиком, сырой тег: {bad!r}"
+        )
 
 
 if __name__ == "__main__":
