@@ -18,6 +18,8 @@ import {
 import BN from "bn.js";
 import DLMM, {
   MAX_ACTIVE_BIN_SLIPPAGE,
+  MAX_RESIZE_LENGTH,
+  ResizeSide,
   StrategyType,
   type LbPosition,
 } from "@meteora-ag/dlmm";
@@ -38,7 +40,12 @@ type Json = Record<string, unknown>;
 const DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const DEVNET_POOL_DEFAULT = "FRTZiQqJig2ib5Urico3yKsQikGG8EERM8mjK94D4o8q";
 const WSOL_MINT = "So11111111111111111111111111111111111111112";
-const COMMANDS = ["rebalance-quote", "rebalance-exec"] as const;
+const COMMANDS = [
+  "rebalance-quote",
+  "rebalance-exec",
+  "snapshot",
+  "resize-exec",
+] as const;
 type ProbeCommand = (typeof COMMANDS)[number];
 
 const COMPUTE_BUDGET_PROGRAM_ID = ComputeBudgetProgram.programId;
@@ -265,16 +272,33 @@ async function snapshotPosition(
   const yUi = amountToUi(d.totalYAmount, dlmm.tokenY.mint.decimals);
   const feeXUi = amountToUi(d.feeX, dlmm.tokenX.mint.decimals);
   const feeYUi = amountToUi(d.feeY, dlmm.tokenY.mint.decimals);
+  const sol = order.solIsX ? xUi : yUi;
+  const usdc = order.solIsX ? yUi : xUi;
+  const priceRaw = Number(active.price.toString());
+  const exp = order.solDecimals - order.usdcDecimals;
+  const usdcPerSol = order.solIsX
+    ? priceRaw * 10 ** exp
+    : 10 ** -exp / (priceRaw || 1);
+  const activeId = dlmm.lbPair.activeId;
+  const bins = binMap(
+    d.positionBinData || [],
+    order,
+    dlmm,
+    activeId,
+    usdcPerSol
+  );
   return {
     found: true,
     position: positionStr,
     lowerBinId: d.lowerBinId,
     upperBinId: d.upperBinId,
     width: d.upperBinId - d.lowerBinId + 1,
-    activeId: dlmm.lbPair.activeId,
+    activeId,
     activeBinPrice: active.price.toString(),
-    sol: order.solIsX ? xUi : yUi,
-    usdc: order.solIsX ? yUi : xUi,
+    usdcPerSol: Number.isFinite(usdcPerSol) ? usdcPerSol : null,
+    sol,
+    usdc,
+    valueUsdc: sol * (Number.isFinite(usdcPerSol) ? usdcPerSol : 0) + usdc,
     fees: {
       sol: order.solIsX ? feeXUi : feeYUi,
       usdc: order.solIsX ? feeYUi : feeXUi,
@@ -285,7 +309,64 @@ async function snapshotPosition(
       feeX: bnish(d.feeX),
       feeY: bnish(d.feeY),
     },
+    bins,
     wallet,
+  };
+}
+
+function binMap(
+  rows: Array<{
+    binId: number;
+    positionXAmount: string;
+    positionYAmount: string;
+  }>,
+  order: { solIsX: boolean },
+  dlmm: DLMM,
+  activeId: number,
+  usdcPerSol: number
+): Json {
+  const xDec = dlmm.tokenX.mint.decimals;
+  const yDec = dlmm.tokenY.mint.decimals;
+  const bins: Json[] = [];
+  let below = 0;
+  let at = 0;
+  let above = 0;
+  let total = 0;
+  let nonempty = 0;
+  for (const row of rows) {
+    const xUi = amountToUi(row.positionXAmount, xDec);
+    const yUi = amountToUi(row.positionYAmount, yDec);
+    const sol = order.solIsX ? xUi : yUi;
+    const usdc = order.solIsX ? yUi : xUi;
+    const valueUsdc =
+      sol * (Number.isFinite(usdcPerSol) ? usdcPerSol : 0) + usdc;
+    const side =
+      row.binId < activeId ? "below" : row.binId > activeId ? "above" : "active";
+    if (sol > 0 || usdc > 0) nonempty += 1;
+    total += valueUsdc;
+    if (side === "below") below += valueUsdc;
+    else if (side === "above") above += valueUsdc;
+    else at += valueUsdc;
+    bins.push({
+      binId: row.binId,
+      sol,
+      usdc,
+      valueUsdc,
+      side,
+    });
+  }
+  const safe = total > 0 ? total : 1;
+  return {
+    count: bins.length,
+    nonempty,
+    activeId,
+    valueUsdc: { below, active: at, above, total },
+    share: {
+      below: below / safe,
+      active: at / safe,
+      above: above / safe,
+    },
+    bins,
   };
 }
 
@@ -427,15 +508,176 @@ async function sendVtx(
   };
 }
 
+async function runResize(args: {
+  cmd: string;
+  flags: Record<string, string | boolean>;
+  connection: Connection;
+  dlmm: DLMM;
+  wallet: Keypair;
+  owner: PublicKey;
+  pubkey: string;
+  poolStr: string;
+  positionStr: string;
+  before: Json;
+  send: boolean;
+  priorityFee: number;
+}): Promise<void> {
+  const {
+    cmd,
+    flags,
+    connection,
+    dlmm,
+    wallet,
+    owner,
+    pubkey,
+    poolStr,
+    positionStr,
+    before,
+    send,
+    priorityFee,
+  } = args;
+  const op = (flagStr(flags, "resize-op") || "").toLowerCase();
+  if (op !== "increase" && op !== "decrease") {
+    fail(cmd, "--resize-op must be increase|decrease", "parseArgs");
+  }
+  const sideName = (flagStr(flags, "resize-side") || "").toLowerCase();
+  if (sideName !== "lower" && sideName !== "upper") {
+    fail(cmd, "--resize-side must be lower|upper", "parseArgs");
+  }
+  const length = flagNum(flags, "resize-length");
+  if (length == null || length < 1 || !Number.isInteger(length)) {
+    fail(cmd, "--resize-length must be a positive integer", "parseArgs");
+  }
+  const maxOne = Number(bnish(MAX_RESIZE_LENGTH));
+  if (length > maxOne) {
+    fail(
+      cmd,
+      `--resize-length ${length} exceeds MAX_RESIZE_LENGTH=${maxOne}`,
+      "parseArgs"
+    );
+  }
+  const side = sideName === "lower" ? ResizeSide.Lower : ResizeSide.Upper;
+  eprint(
+    `cmd=${cmd} op=${op} side=${sideName} length=${length} ` +
+      `mode=${send ? "send" : "simulate"} position=${positionStr}`
+  );
+
+  let txs: Transaction[] | undefined;
+  try {
+    if (op === "increase") {
+      txs = await dlmm.increasePositionLength(
+        new PublicKey(positionStr),
+        side,
+        new BN(length),
+        owner,
+        true
+      );
+    } else {
+      txs = await dlmm.decreasePositionLength(
+        new PublicKey(positionStr),
+        side,
+        new BN(length),
+        true
+      );
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    fail(cmd, msg, "build", { before, op, side: sideName, length });
+  }
+  if (!txs || !txs.length) {
+    fail(cmd, `${op} returned no transactions`, "build", { before });
+  }
+
+  const compiled: Json[] = [];
+  const vtxs: VersionedTransaction[] = [];
+  for (let i = 0; i < txs.length; i++) {
+    try {
+      const c = await compileGroup(
+        connection,
+        owner,
+        txs[i].instructions,
+        i,
+        priorityFee
+      );
+      vtxs.push(c.vtx);
+      compiled.push({ index: i, ixCount: c.ixCount, simulation: c.sim });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      compiled.push({ index: i, error: msg });
+    }
+  }
+
+  const base: Json = {
+    ok: true,
+    action: cmd,
+    network: "devnet",
+    owner: pubkey,
+    pool: poolStr,
+    position: positionStr,
+    params: { op, side: sideName, length, maxResizeLength: maxOne },
+    before,
+    txCount: txs.length,
+    compiled,
+    dryRun: !send,
+  };
+
+  if (!send) {
+    process.stdout.write(JSON.stringify(base) + "\n");
+    return;
+  }
+  if (vtxs.length !== txs.length) {
+    fail(cmd, "some resize txs failed to compile — not sending", "build", base);
+  }
+
+  const sends: Json[] = [];
+  const signatures: string[] = [];
+  for (let i = 0; i < vtxs.length; i++) {
+    try {
+      const row = await sendVtx(connection, wallet, vtxs[i], i);
+      sends.push(row);
+      if (typeof row.signature === "string") signatures.push(row.signature);
+      if (row.status !== "confirmed") {
+        fail(cmd, `tx[${i}] status=${row.status}`, "confirm", {
+          ...base,
+          signatures,
+          sends,
+        });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      fail(cmd, msg, "send", { ...base, signatures, sends });
+    }
+    await sleep(800);
+  }
+
+  await sleep(1500);
+  await dlmm.refetchStates();
+  const after = await snapshotPosition(connection, dlmm, owner, positionStr);
+  process.stdout.write(
+    JSON.stringify({
+      ...base,
+      dryRun: false,
+      sent: true,
+      signatures,
+      sends,
+      after,
+    }) + "\n"
+  );
+}
+
 async function main(): Promise<void> {
   const { cmd, flags } = parseArgs(process.argv.slice(2));
   if (!isProbeCommand(cmd)) {
-    fail(cmd, "unknown command (want rebalance-quote | rebalance-exec)", "parseArgs");
+    fail(
+      cmd,
+      "unknown command (want rebalance-quote | rebalance-exec | snapshot | resize-exec)",
+      "parseArgs"
+    );
   }
 
   const send = flags["send"] === true;
-  if (send && cmd !== "rebalance-exec") {
-    fail(cmd, "--send is only valid on rebalance-exec", "parseArgs");
+  if (send && cmd !== "rebalance-exec" && cmd !== "resize-exec") {
+    fail(cmd, "--send is only valid on rebalance-exec | resize-exec", "parseArgs");
   }
 
   const rpc =
@@ -498,6 +740,39 @@ async function main(): Promise<void> {
     (p: LbPosition) => p.publicKey.toBase58() === positionStr
   );
   if (!pos) fail(cmd, `position ${positionStr} disappeared`, "position");
+
+  if (cmd === "snapshot") {
+    process.stdout.write(
+      JSON.stringify({
+        ok: true,
+        action: cmd,
+        network: "devnet",
+        owner: pubkey,
+        pool: poolStr,
+        position: positionStr,
+        before,
+      }) + "\n"
+    );
+    return;
+  }
+
+  if (cmd === "resize-exec") {
+    await runResize({
+      cmd,
+      flags,
+      connection,
+      dlmm,
+      wallet,
+      owner,
+      pubkey,
+      poolStr,
+      positionStr,
+      before,
+      send,
+      priorityFee,
+    });
+    return;
+  }
 
   const order = solUsdcOrder(dlmm);
   const topUpX = order.solIsX
