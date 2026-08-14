@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import bot_config  # noqa: E402
 import telegram_commands as tg  # noqa: E402
 import telegram_keyboard as kb  # noqa: E402
 
@@ -62,6 +63,31 @@ class KeyboardConsistencyTests(unittest.TestCase):
         text = kb.format_help_message()
         for label in kb.all_button_labels():
             self.assertIn(label, text)
+
+    def test_rebalance_help_follows_model_for_position_cap(self) -> None:
+        for cap in (12.0, 50.0, 400.0):
+            with self.subTest(cap=cap):
+                with patch.object(bot_config, "MAX_POSITION_USD", cap):
+                    text = kb.format_help_message()
+                    line = next(
+                        ln for ln in text.splitlines() if kb.BTN_REBALANCE in ln
+                    )
+                    pct = bot_config.effective_rebalance_cost_frac(cap) * 100.0
+                    hours = bot_config.effective_payback_hours(cap)
+                    self.assertIn(f"{pct:.2f}%", line)
+                    self.assertIn(f"{hours:.1f} ч", line)
+                    self.assertIn(f"${cap:g}", line)
+                    self.assertNotIn("3 часа", line)
+
+    def test_rebalance_help_without_cap_names_no_cost_figures(self) -> None:
+        with patch.object(bot_config, "MAX_POSITION_USD", None):
+            text = kb.format_help_message()
+            line = next(ln for ln in text.splitlines() if kb.BTN_REBALANCE in ln)
+            self.assertIn("зависит от размера позиции", line)
+            self.assertNotIn("0.02%", line)
+            self.assertNotIn("3 часа", line)
+            self.assertNotIn("%", line)
+            self.assertNotIn(" ч.", line)
 
     def test_menu_lists_owner_commands(self) -> None:
         names = [c.command for c in tg._MENU_COMMANDS]
@@ -147,11 +173,38 @@ class ButtonRoutingTests(unittest.IsolatedAsyncioTestCase):
                 h.assert_called_once()
 
     async def test_rebalance_button_does_not_exec_without_confirm(self) -> None:
+        text = await self._rebalance_preview(sol=0.1, usdc=1.0, price=100.0)
+        self.assertIn("/rebalance confirm", text)
+        val = 0.1 * 100.0 + 1.0
+        cost = bot_config.effective_rebalance_cost_usd(val)
+        frac_pct = bot_config.effective_rebalance_cost_frac(val) * 100.0
+        hours = bot_config.effective_payback_hours(val)
+        self.assertIn(f"${cost:.4f}", text)
+        self.assertIn(f"{frac_pct:.3f}%", text)
+        self.assertIn(f"{hours:.1f} ч", text)
+        self.assertNotIn("0.02%", text)
+
+    async def test_rebalance_confirm_at_12_usd_names_working_payback(self) -> None:
+        text = await self._rebalance_preview(sol=0.1, usdc=2.0, price=100.0)
+        val = 12.0
+        cost = bot_config.effective_rebalance_cost_usd(val)
+        frac_pct = bot_config.effective_rebalance_cost_frac(val) * 100.0
+        hours = bot_config.effective_payback_hours(val)
+        self.assertAlmostEqual(hours, 8.7, places=1)
+        self.assertIn("8.7 ч", text)
+        self.assertIn(f"${cost:.4f}", text)
+        self.assertIn(f"{frac_pct:.3f}%", text)
+        self.assertNotIn("3 часа", text)
+        self.assertNotIn("0.02%", text)
+
+    async def _rebalance_preview(
+        self, *, sol: float, usdc: float, price: float
+    ) -> str:
         update, msg, ctx = _update_with_text(kb.BTN_REBALANCE)
         fake_pos = {
             "pubkey": "X",
-            "sol": 0.1,
-            "usdc": 1.0,
+            "sol": sol,
+            "usdc": usdc,
             "lowerBinId": 1,
             "upperBinId": 3,
             "fees": {"sol": 0, "usdc": 0},
@@ -159,14 +212,12 @@ class ButtonRoutingTests(unittest.IsolatedAsyncioTestCase):
         with patch("money_ops.get_primary_position", return_value=fake_pos):
             with patch(
                 "meteora_ops.pool_info",
-                return_value={"usdcPerSol": 100.0, "activeId": 2, "binStep": 1},
+                return_value={"usdcPerSol": price, "activeId": 2, "binStep": 1},
             ):
                 with patch("money_ops.rebalance_position") as reb:
                     await tg.keyboard_button_handler(update, ctx)
                     reb.assert_not_called()
-        text = "\n".join(msg.replies)
-        self.assertIn("/rebalance confirm", text)
-        self.assertIn("0.02%", text)
+        return "\n".join(msg.replies)
 
     async def test_unauthorized_message_ignored(self) -> None:
         update, msg, ctx = _update_with_text(kb.BTN_STATUS, chat_id=999)

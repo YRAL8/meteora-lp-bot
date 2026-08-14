@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from telegram import KeyboardButton, ReplyKeyboardMarkup
 
+import bot_config
+
 # --- Button labels (must match MessageHandler routing exactly) ---
 BTN_STATUS = "📊 Статус"
 BTN_PNL = "📈 PnL"
@@ -39,8 +41,8 @@ BUTTON_HELP: dict[str, str] = {
         "перестановки позиции"
     ),
     BTN_REBALANCE: (
-        "закрыть позицию и открыть заново вокруг текущей цены. Стоит около "
-        "0.02% от позиции, окупается примерно за 3 часа работы в диапазоне. "
+        "закрыть позицию и открыть заново вокруг текущей цены. Стоимость "
+        "зависит от размера позиции и точное число покажет подтверждение. "
         "Спросит подтверждение"
     ),
     BTN_ADD: (
@@ -89,6 +91,24 @@ def build_main_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def rebalance_help_text() -> str:
+    """Help line for Rebalance. Numbers come from the size-aware cost model.
+
+    format_help_message stays argument-free: it reads MAX_POSITION_USD at
+    call time. Other buttons stay as static BUTTON_HELP entries.
+    """
+    cap = bot_config.MAX_POSITION_USD
+    if cap is None:
+        return BUTTON_HELP[BTN_REBALANCE]
+    pct = bot_config.effective_rebalance_cost_frac(cap) * 100.0
+    hours = bot_config.effective_payback_hours(cap)
+    return (
+        "закрыть позицию и открыть заново вокруг текущей цены. "
+        f"При позиции ${cap:g} — около {pct:.2f}% и {hours:.1f} ч. "
+        "Спросит подтверждение"
+    )
+
+
 def format_help_message() -> str:
     lines = [
         "❓ <b>Справка по кнопкам</b>",
@@ -96,7 +116,7 @@ def format_help_message() -> str:
         "",
     ]
     for label in all_button_labels():
-        desc = BUTTON_HELP[label]
+        desc = rebalance_help_text() if label == BTN_REBALANCE else BUTTON_HELP[label]
         lines.append(f"• <b>{label}</b> — {desc}.")
     lines.append("")
     lines.append(

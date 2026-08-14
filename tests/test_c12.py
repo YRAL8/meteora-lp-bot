@@ -94,6 +94,27 @@ class PaybackHoursTests(unittest.TestCase):
         self.assertLess(h1000, 3.5)
         self.assertGreater(h10, h1000)
 
+    def test_cost_functions_match_size_table(self) -> None:
+        import bot_config
+
+        cases = (
+            (12.0, 0.0074, 0.0006166667, 8.7),
+            (50.0, 0.0150, 0.0003, 4.2),
+            (400.0, 0.0850, 0.0002125, 3.0),
+            (1000.0, 0.2050, 0.000205, 2.9),
+        )
+        for pos, cost, frac, hours in cases:
+            with self.subTest(pos=pos):
+                self.assertAlmostEqual(
+                    bot_config.effective_rebalance_cost_usd(pos), cost, places=4
+                )
+                self.assertAlmostEqual(
+                    bot_config.effective_rebalance_cost_frac(pos), frac, places=7
+                )
+                self.assertAlmostEqual(
+                    bot_config.effective_payback_hours(pos), hours, places=1
+                )
+
 
 class ReopenPendingWriteTests(unittest.TestCase):
     def test_oserror_becomes_reopen_pending_write_error(self) -> None:

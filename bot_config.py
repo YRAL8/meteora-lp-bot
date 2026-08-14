@@ -116,15 +116,25 @@ if UNECONOMIC_LOOKBACK_CYCLES < 1:
     raise ValueError("UNECONOMIC_LOOKBACK_CYCLES must be >= 1")
 
 
+def effective_rebalance_cost_usd(position_usd: float) -> float:
+    """USD cost of one rebalance: variable * position + fixed."""
+    pos = max(float(position_usd), 1.0)
+    return REBALANCE_VARIABLE_COST_FRAC * pos + REBALANCE_FIXED_COST_USD
+
+
+def effective_rebalance_cost_frac(position_usd: float) -> float:
+    """Rebalance cost as a fraction of position size."""
+    pos = max(float(position_usd), 1.0)
+    return effective_rebalance_cost_usd(pos) / pos
+
+
 def effective_payback_hours(position_usd: float) -> float:
     """Hours to earn back one rebalance, scaled by position size.
 
     cost_frac = variable + fixed_usd/position; payback = cost_frac / earn_per_h.
     """
-    pos = max(float(position_usd), 1.0)
     earn = max(REBALANCE_EARN_FRAC_PER_HOUR, 1e-12)
-    cost_frac = REBALANCE_VARIABLE_COST_FRAC + (REBALANCE_FIXED_COST_USD / pos)
-    return cost_frac / earn
+    return effective_rebalance_cost_frac(position_usd) / earn
 
 
 def dry_run() -> bool:

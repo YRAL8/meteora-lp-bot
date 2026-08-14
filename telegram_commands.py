@@ -1354,7 +1354,9 @@ async def rebalance_command(
         pool = await _run_money(meteora_ops.pool_info, **money_ops.ops_kwargs())
         price = float(pool.get("usdcPerSol") or 0)
         val = money_ops.position_value_usd(position, price)
-        cost_est = val * 0.0002  # ~0.02% of position
+        cost_est = bot_config.effective_rebalance_cost_usd(val)
+        cost_frac_pct = bot_config.effective_rebalance_cost_frac(val) * 100.0
+        payback_h = bot_config.effective_payback_hours(val)
         half = range_state.current_half_width()
         pct = range_state.current_range_pct()
         await _reply(
@@ -1365,7 +1367,7 @@ async def rebalance_command(
             f"Будет: закрыть → при необходимости свопнуть → открыть вокруг "
             f"текущей цены (±{pct}% / half={half}).\n"
             f"Ориентир стоимости перестановки: ~${cost_est:.4f} "
-            f"(≈0.02% от позиции).\n\n"
+            f"({cost_frac_pct:.3f}% от позиции, окупается за {payback_h:.1f} ч).\n\n"
             f"Подтвердить: /rebalance confirm",
             parse_mode="HTML",
         )
