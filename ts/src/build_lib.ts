@@ -22,6 +22,7 @@ import BN from "bn.js";
 import DLMM, {
   StrategyType,
   POSITION_MIN_SIZE,
+  POSITION_MAX_LENGTH,
   MAX_BIN_LENGTH_ALLOWED_IN_ONE_TX,
   DEFAULT_BIN_PER_POSITION,
   autoFillXByStrategy,
@@ -713,8 +714,13 @@ export async function cmdPoolInfo(
     usdcPerSol,
     priceFromActiveBin: usdcPerSol,
     activeBinPriceLamport: active.price.toString(),
-    // Protocol max bins for one ordinary position (SDK DEFAULT_BIN_PER_POSITION).
-    maxBinsPerPosition: DEFAULT_BIN_PER_POSITION.toNumber(),
+    // Three different SDK limits — do not collapse them into one number.
+    // maxBinsPerPosition: one position account (POSITION_MAX_LENGTH=1400).
+    // defaultBinsPerPosition: SDK default slice / min account size (70).
+    // maxBinLengthAllowedInOneTx: add-liquidity chunk before SDK splits (26).
+    maxBinsPerPosition: POSITION_MAX_LENGTH.toNumber(),
+    defaultBinsPerPosition: DEFAULT_BIN_PER_POSITION.toNumber(),
+    maxBinLengthAllowedInOneTx: MAX_BIN_LENGTH_ALLOWED_IN_ONE_TX,
     reserves: {
       sol: order.solIsX ? reserveX : reserveY,
       usdc: order.solIsX ? reserveY : reserveX,
@@ -979,6 +985,29 @@ export async function cmdBuildOpen(
     })
   );
   const txs = toTxArray(tx);
+
+  // Same gate as add: never send a prefix of a multi-tx open.
+  if (txs.length > 1) {
+    return {
+      ok: false,
+      action,
+      stage: "multi-tx",
+      error:
+        `refusing open: build produced ${txs.length} transactions ` +
+        `(width=${binCount}). If only a prefix lands, later chunks never run.`,
+      owner: owner.toBase58(),
+      pool: pool.toBase58(),
+      params: {
+        minBinId,
+        maxBinId,
+        width: binCount,
+        txCount: txs.length,
+      },
+      txs: [],
+      simulation: [],
+      notes: [`txs returned: ${txs.length}`],
+    };
+  }
 
   const { sdkSize, onChainSize } = positionAccountSizeBytes(binCount);
   const rentSdkSize = await withRpcRetry("rent(sdkSize)", () =>

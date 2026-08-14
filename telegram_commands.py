@@ -682,12 +682,11 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             update,
             f"❌ Запрошено ±{e.requested_pct}% — больше максимума "
             f"±{e.max_pct:.4f}% на этом пуле (binStep={e.bin_step}).\n"
-            f"Одна обычная позиция вмещает не больше {e.max_bins_per_position} "
-            f"ячеек (SDK DEFAULT_BIN_PER_POSITION), то есть half ≤ "
-            f"{e.max_half_width}.\n"
-            "Состояние диапазона НЕ изменено.\n"
-            "Что делать: взять пул с бо́льшим binStep (шире % на ячейку) "
-            "или оставить узкий диапазон.",
+            f"Одна позиция вмещает не больше {e.max_bins_per_position} ячеек "
+            f"(POSITION_MAX_LENGTH), half ≤ {e.max_half_width}. "
+            "Шире — несколько транзакций: если ляжет только начало, "
+            "остальные куски не выполнятся.\n"
+            "Состояние диапазона НЕ изменено.",
         )
     except Exception as e:
         log.exception("/setrange failed")
@@ -801,8 +800,9 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 update,
                 f"❌ Запрошено ±{e.requested_pct}% — больше максимума "
                 f"±{e.max_pct:.4f}% на этом пуле (binStep={e.bin_step}).\n"
-                f"Одна обычная позиция вмещает не больше {e.max_bins_per_position} "
-                f"ячеек (half ≤ {e.max_half_width}).\n"
+                f"Одна позиция вмещает не больше {e.max_bins_per_position} ячеек "
+                f"(POSITION_MAX_LENGTH, half ≤ {e.max_half_width}). "
+                "Шире — несколько транзакций.\n"
                 "Смета не построена, настройка /setrange не менялась.",
             )
         except Exception as e:

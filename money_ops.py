@@ -475,6 +475,50 @@ def format_swap_line(swap_suggestion: dict | None) -> str | None:
     return f"Нужен обмен: {side} {amount}"
 
 
+# SDK calculatePositionSize: POSITION_MIN_SIZE for ≤ DEFAULT_BIN_PER_POSITION (70),
+# then +POSITION_BIN_DATA_SIZE per extra bin. On-chain account adds 8-byte discriminator.
+_SDK_DEFAULT_BINS_PER_POSITION = 70
+_SDK_POSITION_MIN_SIZE = 8112
+_SDK_POSITION_BIN_DATA_SIZE = 112
+_ACCOUNT_DISCRIMINATOR_BYTES = 8
+_RENT_EXEMPT_HEADER_BYTES = 128  # Solana rent is linear in (data_len + 128)
+
+
+def position_onchain_size_bytes(bin_count: int) -> int:
+    extra = max(0, int(bin_count) - _SDK_DEFAULT_BINS_PER_POSITION)
+    return (
+        _SDK_POSITION_MIN_SIZE
+        + extra * _SDK_POSITION_BIN_DATA_SIZE
+        + _ACCOUNT_DISCRIMINATOR_BYTES
+    )
+
+
+def position_rent_sol_for_bins(bin_count: int, rent_info: dict) -> float:
+    """Position-account rent for ``bin_count``, scaled from balances() default quote.
+
+    Uses the Solana rent-exempt linear rule (size+128) and the SDK size formula.
+    When the requested width matches the quoted default, returns the quoted SOL
+    unchanged so a 69-bin open does not drift from the RPC figure.
+    """
+    default_bins = int(rent_info.get("binCount") or 69)
+    default_sol = float(rent_info.get("sol") or 0)
+    if int(bin_count) == default_bins:
+        return default_sol
+    default_bytes = int(
+        rent_info.get("onChainSizeBytes") or position_onchain_size_bytes(default_bins)
+    )
+    want_bytes = position_onchain_size_bytes(bin_count)
+    lamports = float(rent_info.get("lamports") or default_sol * 1e9)
+    if default_bytes <= 0:
+        return default_sol
+    return (
+        lamports
+        * (want_bytes + _RENT_EXEMPT_HEADER_BYTES)
+        / (default_bytes + _RENT_EXEMPT_HEADER_BYTES)
+        / 1e9
+    )
+
+
 def build_open_estimate(
     requested_usd: float,
     *,
@@ -520,21 +564,18 @@ def build_open_estimate(
     )
     # Cap message from apply_max_position_cap is already in notes.
 
-    # Position rent is quoted for the default ordinary open
-    # (positionRentForDefaultOpen.binCount, typically 69 = 2*DEFAULT_RANGE_HALF+1),
-    # not for the requested width. Correct while the bot only opens ordinary
-    # positions. When extended positions land, this estimate line will understate
-    # rent for wider ranges — recompute from the actual bin count then.
     rent_info = bal.get("positionRentForDefaultOpen") or {}
-    rent_sol = float(rent_info.get("sol") or 0)
+    default_rent_sol = float(rent_info.get("sol") or 0)
+    rent_sol = position_rent_sol_for_bins(width_bins, rent_info)
     fee_sol = float(bal.get("feeReserveSol") or FEE_RESERVE_SOL)
     ata_rent_sol, ata_missing = _missing_ata_rent_sol(bal)
 
     sol_have = float((bal.get("sol") or {}).get("ui") or 0)
     usdc_have = float((bal.get("usdc") or {}).get("ui") or 0)
     sao = bal.get("solAvailableForOpen")
+    extra_rent = max(0.0, rent_sol - default_rent_sol)
     usable_sol = (
-        max(0.0, float(sao))
+        max(0.0, float(sao) - extra_rent)
         if sao is not None
         else max(0.0, sol_have - fee_sol - rent_sol)
     )
