@@ -88,28 +88,58 @@ def _command_label(update: Update, fn: Any) -> str:
     return name
 
 
+def _sender_chat_id(update: Update) -> str:
+    chat = getattr(update, "effective_chat", None)
+    cid = getattr(chat, "id", None) if chat is not None else None
+    if isinstance(cid, int):
+        return str(cid)
+    return "?"
+
+
+def format_command_log_line(
+    name: str, *, chat_id: str, args: list, decision: str
+) -> str:
+    """One INFO line: command, args, who, executed/refused."""
+    return f"command {name} chat={chat_id} args={list(args)!r} {decision}"
+
+
+def format_mode_change_log_line(mode: str, *, chat_id: str) -> str:
+    return f"режим: {mode} chat={chat_id}"
+
+
 def owner_command(fn):
-    """Log accept + outcome for every owner command. Does not change behaviour."""
+    """Log one INFO line per owner command. Does not change behaviour."""
 
     @functools.wraps(fn)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         name = _command_label(update, fn)
         raw_args = list(context.args or [])
-        log.info("accepted command %s args=%s", name, raw_args)
+        chat_id = _sender_chat_id(update)
         token = _cmd_outcome.set(("ok", ""))
         try:
             result = await fn(update, context, *args, **kwargs)
         except Exception:
-            log.exception("command %s exception", name)
+            log.exception(
+                "%s",
+                format_command_log_line(
+                    name, chat_id=chat_id, args=raw_args, decision="exception"
+                ),
+            )
             raise
         else:
             kind, detail = _cmd_outcome.get()
             if kind == "refused":
-                log.info("command %s refused: %s", name, detail)
+                decision = f"refused: {detail}"
             elif kind == "exception":
-                log.info("command %s exception: %s", name, detail)
+                decision = f"exception: {detail}"
             else:
-                log.info("command %s ok", name)
+                decision = "ok"
+            log.info(
+                "%s",
+                format_command_log_line(
+                    name, chat_id=chat_id, args=raw_args, decision=decision
+                ),
+            )
             return result
         finally:
             _cmd_outcome.reset(token)
@@ -1451,6 +1481,10 @@ async def rebalance_command(
 async def pauza_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bot_state.bot_paused = True
     bot_state.persist_mode()
+    log.info(
+        "%s",
+        format_mode_change_log_line("пауза", chat_id=_sender_chat_id(update)),
+    )
     await _reply(
         update,
         "⏸ Автоматика приостановлена — авто-мониторинг не работает.\n"
@@ -1463,6 +1497,10 @@ async def pauza_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bot_state.bot_frozen = True
     bot_state.persist_mode()
+    log.info(
+        "%s",
+        format_mode_change_log_line("заморозка", chat_id=_sender_chat_id(update)),
+    )
     await _reply(
         update,
         "🛑 Полная заморозка — автоматика и /rebalance, /addliquidity, /open "
@@ -1478,6 +1516,10 @@ async def boevoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     bot_state.bot_paused = False
     bot_state.bot_frozen = False
     bot_state.persist_mode()
+    log.info(
+        "%s",
+        format_mode_change_log_line("боевой", chat_id=_sender_chat_id(update)),
+    )
     await _reply(
         update,
         "▶️ Бот снова в работе — автоматика и все ручные команды доступны.",

@@ -69,8 +69,9 @@ class CommandLogTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs(tg.log, level="INFO") as cm:
             await tg.open_command(update, ctx)
         joined = "\n".join(cm.output)
-        self.assertIn("accepted command open args=['-1']", joined)
-        self.assertIn("command open refused:", joined)
+        self.assertIn("command open", joined)
+        self.assertIn("args=['-1']", joined)
+        self.assertIn("refused:", joined)
         self.assertTrue(any("больше 0" in r or "❌" in r for r in msg.replies))
 
     async def test_pauza_logs_accept_and_ok(self) -> None:
@@ -80,8 +81,9 @@ class CommandLogTests(unittest.IsolatedAsyncioTestCase):
             with self.assertLogs(tg.log, level="INFO") as cm:
                 await tg.pauza_command(update, ctx)
             joined = "\n".join(cm.output)
-            self.assertIn("accepted command pauza args=[]", joined)
-            self.assertIn("command pauza ok", joined)
+            self.assertIn("command pauza", joined)
+            self.assertIn("args=[]", joined)
+            self.assertIn(" ok", joined)
         finally:
             bot_state.bot_paused = False
 
@@ -158,7 +160,7 @@ class SecretLeakTests(unittest.TestCase):
             host,
         )
         logging.getLogger("telegram_commands").info(
-            "accepted command open args=['10', 'confirm']"
+            "command open chat=4242 args=['10', 'confirm'] ok"
         )
         try:
             raise RuntimeError(f"RPC 401 Unauthorized {BAIT_RPC_URL}")

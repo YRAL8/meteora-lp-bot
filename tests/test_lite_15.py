@@ -2,6 +2,7 @@
 """LITE_15: pause/freeze survive restart; logs; journal fields; pool snapshots."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -82,15 +83,111 @@ class PauseSurvivesRestartTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(bot_state.bot_paused, msg=line)
                 self.assertIn("пауз", line.lower())
 
-    def test_boot_line_is_from_code_not_prose(self) -> None:
-        import bot_mode_state
+class CommandAndTickLogTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self) -> None:
+        bot_state.bot_paused = False
+        bot_state.bot_frozen = False
+        import main as main_mod
 
-        text = bot_mode_state.format_boot_mode_line(
-            paused=True, frozen=False, source="file"
+        main_mod.out_of_range_since = None
+        main_mod.last_auto_attempt_at = None
+        main_mod.reset_storm_guards_for_tests()
+
+    async def test_command_log_line_has_chat_and_decision(self) -> None:
+        line = tg.format_command_log_line(
+            "open", chat_id="4242", args=["-1"], decision="refused: Сумма должна быть больше 0."
         )
-        self.assertIn("/pauza", text)
-        self.assertIn("пауз", text.lower())
+        self.assertEqual(
+            line,
+            "command open chat=4242 args=['-1'] refused: Сумма должна быть больше 0.",
+        )
+        update, msg, ctx = _update(["-1"], chat_id=4242)
+        with self.assertLogs(tg.log, level="INFO") as cm:
+            await tg.open_command(update, ctx)
+        joined = "\n".join(cm.output)
+        self.assertIn(line, joined)
 
+    async def test_mode_change_log_line(self) -> None:
+        line = tg.format_mode_change_log_line("пауза", chat_id="4242")
+        self.assertEqual(line, "режим: пауза chat=4242")
+        update, msg, ctx = _update([], chat_id=4242)
+        with tempfile.TemporaryDirectory() as td:
+            with patch.dict(os.environ, {"METEORA_STATE_DIR": td}):
+                with self.assertLogs(tg.log, level="INFO") as cm:
+                    await tg.pauza_command(update, ctx)
+        joined = "\n".join(cm.output)
+        self.assertIn(line, joined)
 
-if __name__ == "__main__":
-    unittest.main()
+    async def test_heartbeat_ok_logged(self) -> None:
+        import bot_config
+        import main as main_mod
+
+        sleeps: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) >= 2:
+                raise asyncio.CancelledError()
+
+        with (
+            patch.object(bot_config, "HEARTBEAT_INTERVAL_HOURS", 4.0),
+            patch("main.send_telegram_message"),
+            patch("main.format_heartbeat", return_value="beat"),
+            self.assertLogs("main", level="INFO") as cm,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await main_mod.heartbeat_loop(sleep_fn=fake_sleep)
+        self.assertTrue(any("heartbeat ok" in x for x in cm.output))
+
+    async def test_deferred_rebalance_log_line(self) -> None:
+        import bot_config
+        import main as main_mod
+        from datetime import datetime, timedelta, timezone
+
+        t0 = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+        main_mod.out_of_range_since = None
+        main_mod.last_auto_attempt_at = None
+        main_mod.reset_storm_guards_for_tests()
+        main_mod._last_rebalance_at = t0
+        main_mod._rebalance_day_utc = "2026-07-29"
+        main_mod._rebalance_count_today = 1
+        main_mod.out_of_range_since = t0 - timedelta(minutes=30)
+        pos = {
+            "pubkey": "P",
+            "lowerBinId": 100,
+            "upperBinId": 110,
+            "sol": 0.1,
+            "usdc": 5.0,
+            "fees": {},
+        }
+        pool = {
+            "activeId": 200,
+            "binStep": 1,
+            "usdcPerSol": 100.0,
+            "maxBinsPerPosition": 70,
+        }
+        with (
+            patch.object(bot_config, "AUTO_REBALANCE", True),
+            patch.object(bot_config, "REBALANCE_DELAY_MIN", 20),
+            patch.object(bot_config, "MIN_REBALANCE_INTERVAL_MIN", 60),
+            patch.object(bot_config, "MAX_REBALANCES_PER_DAY", 6),
+            patch.object(bot_config, "MAX_POSITION_USD", 50.0),
+            patch.object(bot_config, "effective_network", return_value="devnet"),
+            patch("main.is_reopen_pending", return_value=False),
+            patch("main.money_ops.get_primary_position", return_value=pos),
+            patch("main.meteora_ops.pool_info", return_value=pool),
+            patch(
+                "main.meteora_ops.balances",
+                return_value={
+                    "sol": {"ui": 1.0},
+                    "usdc": {"ui": 10},
+                    "solAvailableForOpen": 0.9,
+                },
+            ),
+            patch("main.send_telegram_message"),
+            patch("main.bot_config.wallet_pubkey", return_value="W"),
+            self.assertLogs("main", level="INFO") as cm,
+        ):
+            await main_mod.monitor_position(now=t0 + timedelta(minutes=10))
+        joined = "\n".join(cm.output)
+        self.assertIn("ребаланс отложен: сторож частоты", joined)

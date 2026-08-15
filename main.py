@@ -314,7 +314,9 @@ async def heartbeat_loop(
     while True:
         await sleep_fn(interval_h * 3600.0)
         try:
-            send_telegram_message(format_heartbeat(now=now_fn()))
+            text = format_heartbeat(now=now_fn())
+            log.info("heartbeat ok")
+            send_telegram_message(text)
         except Exception:
             log.exception("heartbeat send failed — monitor continues")
 
@@ -621,7 +623,7 @@ async def monitor_position(*, now: datetime | None = None) -> None:
         minutes_out = (now - out_of_range_since).total_seconds() / 60.0
         if minutes_out < bot_config.REBALANCE_DELAY_MIN:
             log.info(
-                "Вне диапазона %.1f мин из %s — выдержка",
+                "вне диапазона %.1f минут из %s",
                 minutes_out,
                 bot_config.REBALANCE_DELAY_MIN,
             )
@@ -688,7 +690,7 @@ async def monitor_position(*, now: datetime | None = None) -> None:
             and since_last < bot_config.MIN_REBALANCE_INTERVAL_MIN
         ):
             log.info(
-                "MIN_REBALANCE_INTERVAL: %.1f < %s мин — жду",
+                "ребаланс отложен: сторож частоты (%.1f < %s мин)",
                 since_last,
                 bot_config.MIN_REBALANCE_INTERVAL_MIN,
             )
@@ -802,7 +804,7 @@ async def monitor_position(*, now: datetime | None = None) -> None:
             f"Закрываю → своп при необходимости → открываю вокруг текущей цены."
         )
         send_telegram_message(start_msg)
-        log.info("Начинаю авто-ребаланс (%.0f мин вне)", minutes_out)
+        log.info("ребаланс запущен (%.0f мин вне)", minutes_out)
 
         replies: list[str] = []
         collector = _tg_reply_collector(replies)
