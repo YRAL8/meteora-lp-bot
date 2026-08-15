@@ -12,6 +12,7 @@ import meteora_cycle_journal as cycle_journal
 import meteora_ops
 import money_ops
 import monitor_timer_state
+import pool_snapshots
 import range_state
 import range_width_state
 import state_paths
@@ -1091,6 +1092,9 @@ async def main() -> None:
             heartbeat_task = asyncio.create_task(
                 heartbeat_loop(), name="heartbeat"
             )
+            snapshot_task = asyncio.create_task(
+                pool_snapshots.snapshot_loop(), name="pool-snapshots"
+            )
 
             def _on_monitor_done(task: asyncio.Task) -> None:
                 if task.cancelled():
@@ -1118,7 +1122,8 @@ async def main() -> None:
                 monitor_task.cancel()
                 watchdog_task.cancel()
                 heartbeat_task.cancel()
-                for t in (monitor_task, watchdog_task, heartbeat_task):
+                snapshot_task.cancel()
+                for t in (monitor_task, watchdog_task, heartbeat_task, snapshot_task):
                     try:
                         await t
                     except asyncio.CancelledError:
@@ -1129,7 +1134,11 @@ async def main() -> None:
 
     log.warning("Telegram polling отключён — только мониторинг + heartbeat")
     try:
-        await asyncio.gather(_monitor_loop(), heartbeat_loop())
+        await asyncio.gather(
+            _monitor_loop(),
+            heartbeat_loop(),
+            pool_snapshots.snapshot_loop(),
+        )
     except (KeyboardInterrupt, SystemExit):
         log.info("Остановка по сигналу")
 

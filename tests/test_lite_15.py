@@ -298,5 +298,63 @@ class CycleJournalFieldsTests(unittest.TestCase):
             self.assertEqual(rec["bins_count"], 9)
 
 
+class PoolSnapshotTests(unittest.TestCase):
+    def test_three_appended_rows(self) -> None:
+        import pool_snapshots
+
+        payload = {
+            "tvl": 1_000_000.0,
+            "volume": {"24h": 50_000.0},
+            "fees": {"24h": 120.0},
+            "apy": 35.5,
+            "active_id": -6422,
+            "current_price": 76.67,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            with patch.dict(os.environ, {"METEORA_STATE_DIR": td}):
+                for i in range(3):
+                    pool_snapshots.take_snapshot(
+                        pool="PoolAddr111",
+                        fetch=lambda _addr, n=i: payload,
+                    )
+                text = (Path(td) / "pool_snapshots.jsonl").read_text(encoding="utf-8")
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 3)
+        rows = [json.loads(ln) for ln in lines]
+        for row in rows:
+            self.assertEqual(row["pool"], "PoolAddr111")
+            self.assertEqual(row["tvl"], 1_000_000.0)
+            self.assertEqual(row["volume_24h"], 50_000.0)
+            self.assertEqual(row["fees_24h"], 120.0)
+            self.assertEqual(row["apy"], 35.5)
+            self.assertEqual(row["active_bin"], -6422)
+            self.assertEqual(row["price"], 76.67)
+            self.assertNotIn("error", row)
+
+    def test_api_failure_writes_error_and_stays_alive(self) -> None:
+        import pool_snapshots
+
+        def boom(_addr: str) -> dict:
+            raise TimeoutError("api down")
+
+        with tempfile.TemporaryDirectory() as td:
+            with patch.dict(os.environ, {"METEORA_STATE_DIR": td}):
+                row = pool_snapshots.take_snapshot(pool="PoolAddr111", fetch=boom)
+                self.assertIn("error", row)
+                self.assertIn("TimeoutError", row["error"])
+                # still alive — a second successful row can follow
+                ok = pool_snapshots.take_snapshot(
+                    pool="PoolAddr111",
+                    fetch=lambda _a: {"tvl": 1.0, "apy": 2.0, "current_price": 3.0},
+                )
+                self.assertNotIn("error", ok)
+                lines = (Path(td) / "pool_snapshots.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("error", json.loads(lines[0]))
+        self.assertNotIn("error", json.loads(lines[1]))
+
+
 if __name__ == "__main__":
     unittest.main()
