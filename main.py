@@ -537,15 +537,23 @@ async def monitor_position(*, now: datetime | None = None) -> None:
         usdc_per_sol = float(pool.get("usdcPerSol") or 0)
 
         telegram_notify.price_history.append(usdc_per_sol)
-        cycle_journal.safe_call(
-            cycle_journal.get_default_journal().on_monitor_tick, usdc_per_sol
-        )
 
         pos = money_ops.get_primary_position()
         if pos is None:
             _clear_good_position_snapshot()
+            cycle_journal.safe_call(
+                cycle_journal.get_default_journal().on_monitor_tick, usdc_per_sol
+            )
             log.info("Мониторинг: позиций нет (activeId=%s)", active_id)
             return
+
+        in_rng = position_in_range(pos, active_id)
+        cycle_journal.safe_call(
+            cycle_journal.get_default_journal().on_monitor_tick,
+            usdc_per_sol,
+            in_rng,
+            bot_config.POLL_INTERVAL_SEC / 60.0,
+        )
 
         _store_good_position_snapshot(
             pos,
@@ -554,7 +562,6 @@ async def monitor_position(*, now: datetime | None = None) -> None:
             bin_step=bin_step,
             now=now,
         )
-        in_rng = position_in_range(pos, active_id)
         lo_p, hi_p = _price_bounds(pos, active_id, usdc_per_sol, bin_step)
         trend = format_price_trend(usdc_per_sol, bot_config.POLL_INTERVAL_SEC)
         price_line = f"📈 Цена SOL: ${usdc_per_sol:.4f}{trend}"

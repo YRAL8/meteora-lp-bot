@@ -493,6 +493,17 @@ def position_onchain_size_bytes(bin_count: int) -> int:
     )
 
 
+def _journal_position_rent_sol(bin_count: int) -> float | None:
+    """Best-effort rent for the journal. Must not affect the open that already landed."""
+    try:
+        bal = meteora_ops.balances(owner(), **ops_kwargs())
+        rent_info = bal.get("positionRentForDefaultOpen") or {}
+        return float(position_rent_sol_for_bins(bin_count, rent_info))
+    except Exception:
+        log.warning("position rent for journal unavailable", exc_info=True)
+        return None
+
+
 def position_rent_sol_for_bins(bin_count: int, rent_info: dict) -> float:
     """Position-account rent for ``bin_count``, scaled from balances() default quote.
 
@@ -922,6 +933,11 @@ def open_with_budget(
             open_sol_qty=sol_qty,
             open_usdc_qty=usdc_qty,
             open_position_value_usd=sol_qty * price + usdc_qty,
+            bin_step=bin_step,
+            bins_count=int(max_bin) - int(min_bin) + 1,
+            position_rent_sol=_journal_position_rent_sol(
+                int(max_bin) - int(min_bin) + 1
+            ),
         )
         # Manual recovery after aborted rebalance: successful open clears the flag.
         from reopen_pending import is_reopen_pending

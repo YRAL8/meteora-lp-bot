@@ -191,3 +191,112 @@ class CommandAndTickLogTests(unittest.IsolatedAsyncioTestCase):
             await main_mod.monitor_position(now=t0 + timedelta(minutes=10))
         joined = "\n".join(cm.output)
         self.assertIn("ребаланс отложен: сторож частоты", joined)
+
+
+class CycleJournalFieldsTests(unittest.TestCase):
+    def test_new_record_has_width_time_and_rent_fields(self) -> None:
+        from datetime import datetime, timezone
+
+        from meteora_cycle_journal import JOURNAL_RECORD_VERSION, CycleJournal
+
+        with tempfile.TemporaryDirectory() as td:
+            j = CycleJournal(data_dir=td)
+            t0 = datetime(2026, 5, 1, tzinfo=timezone.utc)
+            j.on_open(
+                position_pubkey="Pos111",
+                range_width_pct=1.0,
+                lower_bin_id=10,
+                upper_bin_id=18,
+                lower_price=90.0,
+                upper_price=110.0,
+                open_price=100.0,
+                open_sol_qty=0.1,
+                open_usdc_qty=10.0,
+                open_position_value_usd=20.0,
+                now=t0,
+                bin_step=4,
+                bins_count=9,
+                position_rent_sol=0.0738,
+            )
+            j.on_monitor_tick(100.0, True, 5.0)
+            j.on_monitor_tick(120.0, False, 5.0)
+            j.capture_close_snapshot(
+                close_price=105.0,
+                close_position_value_usd=20.5,
+                fees_sol=0.001,
+                fees_usdc=0.2,
+                now=datetime(2026, 5, 1, 1, tzinfo=timezone.utc),
+            )
+            j.finalize_pending_cycle()
+            rec = j.read_all_cycles()[0]
+            self.assertEqual(rec["version"], JOURNAL_RECORD_VERSION)
+            self.assertEqual(rec["bin_step"], 4)
+            self.assertEqual(rec["bins_count"], 9)
+            self.assertEqual(rec["in_range_minutes"], 5.0)
+            self.assertEqual(rec["out_of_range_minutes"], 5.0)
+            self.assertEqual(rec["position_rent_sol"], 0.0738)
+
+    def test_old_journal_line_without_new_fields_still_reads(self) -> None:
+        from meteora_cycle_journal import CycleJournal
+
+        old = {
+            "version": 1,
+            "mint": "OldPos",
+            "fees_usd": 1.25,
+            "divergence_usd": -0.4,
+            "pnl_usd": 0.8,
+            "duration_hours": 3.0,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "cycle_journal.jsonl"
+            path.write_text(json.dumps(old) + "\n", encoding="utf-8")
+            recs = CycleJournal(data_dir=td).read_all_cycles()
+            self.assertEqual(len(recs), 1)
+            self.assertEqual(recs[0]["mint"], "OldPos")
+            self.assertEqual(recs[0]["fees_usd"], 1.25)
+            self.assertIsNone(recs[0].get("bin_step"))
+            self.assertIsNone(recs[0].get("in_range_minutes"))
+
+    def test_old_active_state_without_new_fields_finalizes(self) -> None:
+        from meteora_cycle_journal import CycleJournal
+
+        old_state = {
+            "version": 1,
+            "active": None,
+            "pending_close": {
+                "cycle": {
+                    "mint": "OldPos",
+                    "open_time_utc": "2026-05-01T00:00:00Z",
+                    "range_width_pct": 1.0,
+                    "lower_price": 90.0,
+                    "upper_price": 110.0,
+                    "open_price": 100.0,
+                    "open_sol_qty": 0.1,
+                    "open_usdc_qty": 10.0,
+                    "open_position_value_usd": 20.0,
+                    "lower_bin_id": 10,
+                    "upper_bin_id": 18,
+                },
+                "close_time_utc": "2026-05-01T01:00:00Z",
+                "close_price": 105.0,
+                "close_position_value_usd": 20.5,
+                "fees_sol": 0.0,
+                "fees_usdc": 0.1,
+                "trigger": "manual",
+            },
+            "pending_swap": None,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "cycle_state.json").write_text(
+                json.dumps(old_state), encoding="utf-8"
+            )
+            j = CycleJournal(data_dir=td)
+            j.finalize_pending_cycle()
+            rec = j.read_all_cycles()[0]
+            self.assertEqual(rec["mint"], "OldPos")
+            self.assertIn("bin_step", rec)
+            self.assertEqual(rec["bins_count"], 9)
+
+
+if __name__ == "__main__":
+    unittest.main()

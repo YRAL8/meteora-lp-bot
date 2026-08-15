@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,6 +37,7 @@ def default_data_dir() -> str:
 # Back-compat alias (resolved at import; prefer default_data_dir()).
 DEFAULT_DATA_DIR = default_data_dir()
 
+JOURNAL_RECORD_VERSION = 2
 MAX_JOURNAL_RECORDS = 5000
 MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 
@@ -92,6 +93,11 @@ class ActiveCycle:
     open_position_value_usd: float
     lower_bin_id: int = 0
     upper_bin_id: int = 0
+    bin_step: int = 0
+    bins_count: int = 0
+    in_range_minutes: float = 0.0
+    out_of_range_minutes: float = 0.0
+    position_rent_sol: float | None = None
     samples: int = 0
     path_sum: float = 0.0
     min_price: float = 0.0
@@ -127,11 +133,12 @@ class StateFile:
     pending_swap: PendingSwap | None = None
 
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
+def _cycle_from_mapping(raw: Any) -> ActiveCycle:
+    """Load ActiveCycle from JSON; ignore unknown keys, fill missing with defaults."""
+    if not isinstance(raw, dict):
+        raise TypeError("active cycle is not an object")
+    allowed = {f.name for f in fields(ActiveCycle)}
+    return ActiveCycle(**{k: raw[k] for k in allowed if k in raw})
 
 
 class CycleJournal:
@@ -168,11 +175,11 @@ class CycleJournal:
         try:
             st = StateFile(version=int(raw.get("version", 1)))
             if raw.get("active"):
-                st.active = ActiveCycle(**raw["active"])
+                st.active = _cycle_from_mapping(raw["active"])
             if raw.get("pending_close"):
                 pc = raw["pending_close"]
                 st.pending_close = PendingClose(
-                    cycle=ActiveCycle(**pc["cycle"]),
+                    cycle=_cycle_from_mapping(pc["cycle"]),
                     close_time_utc=pc["close_time_utc"],
                     close_price=float(pc["close_price"]),
                     close_position_value_usd=float(pc["close_position_value_usd"]),
@@ -276,10 +283,16 @@ class CycleJournal:
         open_usdc_qty: float,
         open_position_value_usd: float,
         now: datetime | None = None,
+        bin_step: int = 0,
+        bins_count: int = 0,
+        position_rent_sol: float | None = None,
     ) -> None:
         now = now or _utc_now()
         self.finalize_pending_cycle()
         st = self._load_state()
+        bins = int(bins_count) if bins_count else max(
+            0, int(upper_bin_id) - int(lower_bin_id) + 1
+        )
         active = ActiveCycle(
             mint=position_pubkey,
             open_time_utc=_utc_iso(now),
@@ -292,6 +305,13 @@ class CycleJournal:
             open_position_value_usd=float(open_position_value_usd),
             lower_bin_id=int(lower_bin_id),
             upper_bin_id=int(upper_bin_id),
+            bin_step=int(bin_step or 0),
+            bins_count=bins,
+            in_range_minutes=0.0,
+            out_of_range_minutes=0.0,
+            position_rent_sol=(
+                float(position_rent_sol) if position_rent_sol is not None else None
+            ),
             samples=0,
             path_sum=0.0,
             min_price=float(open_price),
@@ -303,7 +323,12 @@ class CycleJournal:
         st.active = active
         self._save_state(st)
 
-    def on_monitor_tick(self, price: float) -> None:
+    def on_monitor_tick(
+        self,
+        price: float,
+        in_range: bool | None = None,
+        tick_minutes: float | None = None,
+    ) -> None:
         st = self._load_state()
         if st.active is None:
             return
@@ -318,6 +343,14 @@ class CycleJournal:
             st.active.max_price = p
         st.active.min_price = min(st.active.min_price, p)
         st.active.max_price = max(st.active.max_price, p)
+        if in_range is not None and tick_minutes is not None:
+            dt = max(0.0, float(tick_minutes))
+            if in_range:
+                st.active.in_range_minutes = float(st.active.in_range_minutes or 0.0) + dt
+            else:
+                st.active.out_of_range_minutes = (
+                    float(st.active.out_of_range_minutes or 0.0) + dt
+                )
         self._save_state(st)
 
     def mark_add_liquidity_incomplete(self) -> None:
@@ -431,7 +464,7 @@ class CycleJournal:
             else 0.0
         )
         record: dict[str, Any] = {
-            "version": 1,
+            "version": JOURNAL_RECORD_VERSION,
             "mint": cycle.mint,
             "open_time_utc": cycle.open_time_utc,
             "close_time_utc": st.pending_close.close_time_utc,
@@ -440,6 +473,16 @@ class CycleJournal:
             "upper_price": cycle.upper_price,
             "lower_bin_id": cycle.lower_bin_id,
             "upper_bin_id": cycle.upper_bin_id,
+            "bin_step": int(getattr(cycle, "bin_step", 0) or 0),
+            "bins_count": int(
+                getattr(cycle, "bins_count", 0)
+                or max(0, int(cycle.upper_bin_id) - int(cycle.lower_bin_id) + 1)
+            ),
+            "in_range_minutes": float(getattr(cycle, "in_range_minutes", 0.0) or 0.0),
+            "out_of_range_minutes": float(
+                getattr(cycle, "out_of_range_minutes", 0.0) or 0.0
+            ),
+            "position_rent_sol": getattr(cycle, "position_rent_sol", None),
             "open_price": cycle.open_price,
             "close_price": close_price,
             "open_sol_qty": cycle.open_sol_qty,
