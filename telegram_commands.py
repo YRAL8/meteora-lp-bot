@@ -1450,6 +1450,7 @@ async def rebalance_command(
 @owner_command
 async def pauza_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bot_state.bot_paused = True
+    bot_state.persist_mode()
     await _reply(
         update,
         "⏸ Автоматика приостановлена — авто-мониторинг не работает.\n"
@@ -1461,6 +1462,7 @@ async def pauza_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 @owner_command
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bot_state.bot_frozen = True
+    bot_state.persist_mode()
     await _reply(
         update,
         "🛑 Полная заморозка — автоматика и /rebalance, /addliquidity, /open "
@@ -1475,6 +1477,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def boevoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bot_state.bot_paused = False
     bot_state.bot_frozen = False
+    bot_state.persist_mode()
     await _reply(
         update,
         "▶️ Бот снова в работе — автоматика и все ручные команды доступны.",

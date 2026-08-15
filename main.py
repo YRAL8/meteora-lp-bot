@@ -884,6 +884,7 @@ async def main() -> None:
     _assert_mainnet_rpc_explicit()
     state_paths.state_dir().mkdir(parents=True, exist_ok=True)
     bot_logging.attach_state_file_log()
+    boot_mode_line = bot_state.restore_mode()
     out_of_range_since, last_auto_attempt_at = monitor_timer_state.load_timers()
 
     range_restore = RangeRestoreResult(
@@ -1048,6 +1049,7 @@ async def main() -> None:
     send_telegram_message(
         f"🤖 <b>Meteora LP-бот запущен</b>\n"
         f"Режим: {mode} · сеть: {bot_config.effective_network()}\n"
+        f"{escape_html(boot_mode_line)}\n"
         f"RPC: <code>{escape_html(rpc_host)}</code>\n"
         f"{auto_line} · выдержка {bot_config.REBALANCE_DELAY_MIN} мин\n"
         f"{width_line}{boot_extra}\n"
