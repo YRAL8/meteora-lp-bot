@@ -482,10 +482,7 @@ async function sendVtx(
     vtxIn,
     index,
     [wallet],
-    async () => {
-      const { blockhash } = await connection.getLatestBlockhash("confirmed");
-      return blockhash;
-    }
+    async () => connection.getLatestBlockhash("confirmed")
   );
   const vtx = prepared.vtx;
   const signature = prepared.signature;

@@ -192,6 +192,82 @@ class ResolveRpcClassificationTests(unittest.TestCase):
             self.assertEqual(latest["status"], "confirmed")
             self.assertEqual(latest["slot"], 4242)
 
+    def test_absent_signature_past_window_becomes_dropped(self) -> None:
+        """Node answers, signature nowhere, blockhash window long gone.
+
+        That is a final answer — the tx never landed — so the row must stop
+        blocking money operations without the owner running journal-forget.
+        """
+        import exec_journal_io
+        import meteora_exec
+
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["METEORA_STATE_DIR"] = td
+            sig = "Lite1Dropped" + ("4" * 40)
+            exec_journal_io.append_entry(
+                {
+                    "ts": "2026-07-30T00:00:00Z",
+                    "action": "exec-close",
+                    "network": "devnet",
+                    "params": {},
+                    "signature": sig,
+                    "status": "unknown",
+                }
+            )
+
+            def absent(_rpc: str, _sig: str, **_k: Any) -> None:
+                return None
+
+            with patch.object(meteora_exec, "_rpc_get_signature_statuses", absent):
+                out = meteora_exec.resolve_unresolved_signatures(
+                    rpc_url="http://127.0.0.1:9",
+                    timeout_ms=60,
+                    poll_ms=20,
+                    wall_ms=300,
+                    network="devnet",
+                    sleep_fn=lambda _s: None,
+                )
+            self.assertTrue(out.get("ok"))
+            self.assertEqual(exec_journal_io.list_unresolved(), [])
+            latest = exec_journal_io.read_entries()[-1]
+            self.assertEqual(latest["status"], "dropped")
+            self.assertIn("never landed", str(latest["error"]))
+
+    def test_absent_signature_inside_window_stays_unknown(self) -> None:
+        """A tx sent seconds ago may still be in flight — must keep blocking."""
+        import exec_journal_io
+        import meteora_exec
+
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["METEORA_STATE_DIR"] = td
+            sig = "Lite1InFlight" + ("5" * 40)
+            exec_journal_io.append_entry(
+                {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "action": "exec-close",
+                    "network": "devnet",
+                    "params": {},
+                    "signature": sig,
+                    "status": "unknown",
+                }
+            )
+
+            def absent(_rpc: str, _sig: str, **_k: Any) -> None:
+                return None
+
+            with patch.object(meteora_exec, "_rpc_get_signature_statuses", absent):
+                meteora_exec.resolve_unresolved_signatures(
+                    rpc_url="http://127.0.0.1:9",
+                    timeout_ms=60,
+                    poll_ms=20,
+                    wall_ms=300,
+                    network="devnet",
+                    sleep_fn=lambda _s: None,
+                )
+            rows = exec_journal_io.list_unresolved()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "unknown")
+
     def test_is_transient_classifier(self) -> None:
         import meteora_exec
 

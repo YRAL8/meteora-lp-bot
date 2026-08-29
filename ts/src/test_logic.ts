@@ -3,6 +3,7 @@
  */
 import { assertSendAllowed, parseNetwork } from "./network";
 import {
+  confirmWithRebroadcast,
   pickSignersForPubkeys,
   prepareTxForSend,
   refreshVersionedBlockhash,
@@ -145,15 +146,20 @@ async function testPrepareTxForSendFreshBlockhash(): Promise<void> {
   const vtx0 = makeSignedTransfer(payer, bh1);
   const sig0 = signatureFromVersioned(vtx0);
 
-  // index 0 — no refresh
-  const first = await prepareTxForSend(vtx0, 0, [payer], async () => bh2);
-  assert(first.refreshed === false, "tx0 not refreshed");
-  assert(first.signature.length > 0, "tx0 signed");
+  const fresh = async () => ({ blockhash: bh2, lastValidBlockHeight: 4242 });
 
-  // index 1 — refresh + resign → different signature
-  const second = await prepareTxForSend(vtx0, 1, [payer], async () => bh2);
+  // index 0 — refreshed too: the build phase may have spent half the
+  // blockhash lifetime simulating before we get here.
+  const first = await prepareTxForSend(vtx0, 0, [payer], fresh);
+  assert(first.refreshed === true, "tx0 refreshed");
+  assert(first.signature !== sig0, "tx0 fresh blockhash changes signature");
+  assert(first.lastValidBlockHeight === 4242, "tx0 reports expiry height");
+
+  // index 1 — same contract
+  const second = await prepareTxForSend(vtx0, 1, [payer], fresh);
   assert(second.refreshed === true, "tx1 refreshed");
   assert(second.signature !== sig0, "fresh blockhash changes signature");
+  assert(second.lastValidBlockHeight === 4242, "tx1 reports expiry height");
 
   // Missing second signer fails
   const other = Keypair.generate();
@@ -209,6 +215,110 @@ function testMultiTxAddGateOnTxCountNotWidth(): void {
   assert(msg.includes("partially funded"), "refuse names partial-fill risk");
 }
 
+
+type FakeStatus = {
+  err: unknown;
+  slot?: number;
+  confirmationStatus?: string | null;
+} | null;
+
+/**
+ * Fake cluster: answers `statuses[callIndex]` (last value repeats) and reports
+ * a block height that climbs one per poll from `startHeight`.
+ */
+function fakeRpc(opts: {
+  statuses: FakeStatus[];
+  startHeight: number;
+  sendThrows?: boolean;
+  statusThrows?: boolean;
+}) {
+  const sends: number[] = [];
+  let statusCalls = 0;
+  let height = opts.startHeight;
+  const rpc = {
+    async getSignatureStatuses(sigs: string[], _cfg: { searchTransactionHistory: boolean }) {
+      void sigs;
+      if (opts.statusThrows) throw new Error("fetch failed");
+      const i = Math.min(statusCalls, opts.statuses.length - 1);
+      statusCalls += 1;
+      return { value: [opts.statuses[i]] };
+    },
+    async sendRawTransaction(raw: Uint8Array, _o: { skipPreflight: boolean; maxRetries: number }) {
+      void raw;
+      if (opts.sendThrows) throw new Error("send failed");
+      sends.push(height);
+      return "sig";
+    },
+    async getBlockHeight(_c: "confirmed") {
+      height += 1;
+      return height;
+    },
+  };
+  return { rpc, sends, sendCount: () => sends.length };
+}
+
+async function testConfirmRebroadcastsUntilLanded(): Promise<void> {
+  // Absent, absent, then confirmed → confirmed, and it kept re-sending meanwhile.
+  const f = fakeRpc({
+    statuses: [null, null, { err: null, slot: 77, confirmationStatus: "confirmed" }],
+    startHeight: 100,
+  });
+  const out = await confirmWithRebroadcast(f.rpc, new Uint8Array([1]), "sig", 1_000, {
+    pollMs: 0,
+    now: () => 0,
+    sleepFn: async () => {},
+  });
+  assert(out.outcome === "confirmed", "landed tx confirms");
+  assert(out.slot === 77, "confirmed reports slot");
+  assert(f.sendCount() >= 2, "re-broadcasts while waiting");
+}
+
+async function testConfirmReportsOnChainFailure(): Promise<void> {
+  const f = fakeRpc({
+    statuses: [{ err: { InstructionError: [0, "Custom"] }, slot: 5 }],
+    startHeight: 100,
+  });
+  const out = await confirmWithRebroadcast(f.rpc, new Uint8Array([1]), "sig", 1_000, {
+    pollMs: 0,
+    now: () => 0,
+    sleepFn: async () => {},
+  });
+  assert(out.outcome === "failed", "on-chain error is failed, not dropped");
+  assert(out.slot === 5, "failed reports slot");
+}
+
+async function testConfirmDropsWhenBlockhashExpires(): Promise<void> {
+  // Never lands; height starts past lastValidBlockHeight → expiry, then grace.
+  let clock = 0;
+  const f = fakeRpc({ statuses: [null], startHeight: 500 });
+  const out = await confirmWithRebroadcast(f.rpc, new Uint8Array([1]), "sig", 400, {
+    pollMs: 0,
+    graceMs: 10,
+    now: () => (clock += 5),
+    sleepFn: async () => {},
+  });
+  assert(out.outcome === "dropped", "expired + absent is dropped");
+  assert(
+    String(out.error).includes("never landed"),
+    "dropped says the tx never landed"
+  );
+  const before = f.sendCount();
+  assert(before >= 1, "sent at least once before expiry");
+}
+
+async function testConfirmStaysUnknownWhenRpcIsDown(): Promise<void> {
+  // Node unreachable: we never learn anything, so it must NOT claim dropped.
+  let clock = 0;
+  const f = fakeRpc({ statuses: [null], startHeight: 100, statusThrows: true });
+  const out = await confirmWithRebroadcast(f.rpc, new Uint8Array([1]), "sig", 1_000_000, {
+    pollMs: 0,
+    timeoutMs: 40,
+    now: () => (clock += 10),
+    sleepFn: async () => {},
+  });
+  assert(out.outcome === "unknown", "RPC down stays unknown, never dropped");
+}
+
 testMainnetGuard();
 testParseNetworkDefault();
 testNegativeAmounts();
@@ -218,6 +328,10 @@ testMultiTxAddGateOnTxCountNotWidth();
 
 Promise.resolve()
   .then(() => testPrepareTxForSendFreshBlockhash())
+  .then(() => testConfirmRebroadcastsUntilLanded())
+  .then(() => testConfirmReportsOnChainFailure())
+  .then(() => testConfirmDropsWhenBlockhashExpires())
+  .then(() => testConfirmStaysUnknownWhenRpcIsDown())
   .then(() => {
     console.log(`test_logic: passed=${passed} failed=${failed}`);
     process.exit(failed > 0 ? 1 : 0);

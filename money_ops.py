@@ -775,11 +775,25 @@ def assert_exec_fully_confirmed(payload: dict) -> None:
     for s in payload.get("sends") or []:
         st = s.get("status")
         if st and st != "confirmed":
+            if st == "dropped":
+                # Blockhash expired with the signature absent: the tx never
+                # reached a block, so nothing was executed and a retry is safe.
+                error = (
+                    "транзакция не дошла до сети (blockhash истёк) — "
+                    "ничего не выполнено, можно повторить"
+                )
+                stage = "confirm-dropped"
+            elif st == "unknown":
+                error = f"tx status={st!r} — not confirmed"
+                stage = "confirm-unknown"
+            else:
+                error = f"tx status={st!r} — not confirmed"
+                stage = "confirm"
             raise MeteoraExecError(
                 {
                     "ok": False,
-                    "error": f"tx status={st!r} — not confirmed",
-                    "stage": "confirm-unknown" if st == "unknown" else "confirm",
+                    "error": error,
+                    "stage": stage,
                     "confirmationUnknown": st == "unknown",
                     "sends": payload.get("sends"),
                     "signatures": payload.get("signatures"),

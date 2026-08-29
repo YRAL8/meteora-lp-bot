@@ -21,6 +21,7 @@ import {
   cmdBuildSwap,
   cmdBuildWithdraw,
   eprint,
+  confirmWithRebroadcast,
   fail,
   flagStr,
   parseArgs,
@@ -44,8 +45,6 @@ type TxMeta = {
   base64: string;
   signers: string[];
 };
-
-type ConfirmOutcome = "confirmed" | "failed" | "unknown";
 
 const EXEC_COMMANDS = [
   "exec-open",
@@ -182,74 +181,6 @@ function awaitJournalHandshake(signature: string): Promise<boolean> {
   });
 }
 
-/** Same transient class as former journal.ts / build_lib.withRpcRetry. */
-function isTransientRpcError(msg: string): boolean {
-  const low = msg.toLowerCase();
-  return (
-    msg.includes("429") ||
-    low.includes("too many requests") ||
-    low.includes("rate limit") ||
-    low.includes("fetch failed") ||
-    low.includes("socket hang up") ||
-    low.includes("network error") ||
-    low.includes("econnreset") ||
-    low.includes("econnrefused") ||
-    low.includes("etimedout") ||
-    low.includes("timeout") ||
-    low.includes("eai_again") ||
-    low.includes("502") ||
-    low.includes("503") ||
-    low.includes("504")
-  );
-}
-
-async function pollSignatureStatus(
-  connection: Connection,
-  signature: string,
-  timeoutMs = 90_000,
-  pollMs = 2_000
-): Promise<{
-  outcome: ConfirmOutcome;
-  slot: number | null;
-  error: string | null;
-}> {
-  const start = Date.now();
-  let lastError: string | null = null;
-  while (Date.now() - start < timeoutMs) {
-    let resp;
-    try {
-      resp = await connection.getSignatureStatuses([signature], {
-        searchTransactionHistory: true,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      lastError = msg;
-      if (isTransientRpcError(msg)) {
-        await sleep(pollMs);
-        continue;
-      }
-      await sleep(pollMs);
-      continue;
-    }
-    const st = resp.value[0];
-    if (st) {
-      if (st.err) {
-        return {
-          outcome: "failed",
-          slot: st.slot ?? null,
-          error: JSON.stringify(st.err),
-        };
-      }
-      const conf = st.confirmationStatus;
-      if (conf === "confirmed" || conf === "finalized") {
-        return { outcome: "confirmed", slot: st.slot ?? null, error: null };
-      }
-    }
-    await sleep(pollMs);
-  }
-  return { outcome: "unknown", slot: null, error: lastError };
-}
-
 function partialFillExtra(
   sends: Json[],
   totalTxs: number
@@ -340,24 +271,22 @@ async function sendBuildResult(
     );
 
     let signature: string;
+    let lastValidBlockHeight: number;
     try {
       const prepared = await prepareTxForSend(
         vtx,
         txMeta.index,
         available,
-        async () => {
-          const { blockhash } = await connection.getLatestBlockhash("confirmed");
-          return blockhash;
-        }
+        async () => connection.getLatestBlockhash("confirmed")
       );
       vtx = prepared.vtx;
       signature = prepared.signature;
-      if (prepared.refreshed) {
-        eprint(
-          `tx[${txMeta.index}] re-signed with fresh blockhash ` +
-            `(signers=${prepared.signers.join(",")})`
-        );
-      }
+      lastValidBlockHeight = prepared.lastValidBlockHeight;
+      eprint(
+        `tx[${txMeta.index}] re-signed with fresh blockhash ` +
+          `(lastValidBlockHeight=${lastValidBlockHeight}, ` +
+          `signers=${prepared.signers.join(",")})`
+      );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const confirmed = sends.filter((s) => s.status === "confirmed").length;
@@ -422,8 +351,9 @@ async function sendBuildResult(
     }
 
     eprint(`sending tx[${txMeta.index}] signature=${signature}`);
+    const rawTx = vtx.serialize();
     try {
-      await connection.sendRawTransaction(vtx.serialize(), {
+      await connection.sendRawTransaction(rawTx, {
         skipPreflight: true,
         maxRetries: 3,
       });
@@ -468,16 +398,13 @@ async function sendBuildResult(
       process.exit(42);
     }
 
-    const { outcome, slot, error } = await pollSignatureStatus(
+    const { outcome, slot, error } = await confirmWithRebroadcast(
       connection,
-      signature
+      rawTx,
+      signature,
+      lastValidBlockHeight
     );
-    const status =
-      outcome === "confirmed"
-        ? "confirmed"
-        : outcome === "failed"
-          ? "failed"
-          : "unknown";
+    const status = outcome;
 
     signatures.push(signature);
     sends.push({
@@ -501,6 +428,32 @@ async function sendBuildResult(
         ),
         "confirm",
         {
+          network,
+          signatures,
+          sends,
+          params,
+          ...partialFillExtra(sends, txs.length),
+        }
+      );
+    }
+    if (status === "dropped") {
+      eprint(
+        `tx[${txMeta.index}] dropped — blockhash expired and the signature ` +
+          "never reached the cluster; nothing was executed, retrying is safe"
+      );
+      const confirmed = sends.filter((s) => s.status === "confirmed").length;
+      fail(
+        action,
+        partialFillMessage(
+          txMeta.index,
+          txs.length,
+          confirmed,
+          `tx[${txMeta.index}] dropped before inclusion (blockhash expired) — ` +
+            "nothing was executed; safe to retry"
+        ),
+        "confirm-dropped",
+        {
+          confirmationUnknown: false,
           network,
           signatures,
           sends,

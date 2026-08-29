@@ -454,36 +454,170 @@ export function refuseMultiTxAddError(txCount: number, width: number): string {
   );
 }
 
+/** Blockhash plus the block height after which it can no longer be included. */
+export type SendBlockhash = {
+  blockhash: string;
+  lastValidBlockHeight: number;
+};
+
+/** What a send ended as. `dropped` is final: the tx can never land. */
+export type ConfirmOutcome = "confirmed" | "failed" | "dropped" | "unknown";
+
+/** The slice of web3.js Connection that confirmation needs (keeps it testable). */
+export type ConfirmRpc = {
+  getSignatureStatuses(
+    signatures: string[],
+    config: { searchTransactionHistory: boolean }
+  ): Promise<{
+    value: Array<{
+      err: unknown;
+      slot?: number;
+      confirmationStatus?: string | null;
+    } | null>;
+  }>;
+  sendRawTransaction(
+    rawTransaction: Uint8Array,
+    options: { skipPreflight: boolean; maxRetries: number }
+  ): Promise<string>;
+  getBlockHeight(commitment: "confirmed"): Promise<number>;
+};
+
 /**
- * For multi-tx batches: refresh blockhash on every part after the first,
- * then sign with all required keys. Journal must use the returned signature.
+ * Confirm one signature while re-broadcasting it until its blockhash dies.
+ *
+ * A single sendRawTransaction is not delivery: the leader may simply drop the
+ * packet, and nothing retries it. So we keep re-sending the same signed bytes
+ * every poll until the network either includes the tx or the blockhash expires.
+ *
+ * Once the chain passes lastValidBlockHeight and the signature is still absent,
+ * the tx can never land — that is `dropped`, a final answer, not `unknown`.
+ * `unknown` is now reserved for the case we genuinely could not determine
+ * (RPC unreachable, or the wall clock ran out before expiry).
+ */
+export async function confirmWithRebroadcast(
+  connection: ConfirmRpc,
+  rawTx: Uint8Array,
+  signature: string,
+  lastValidBlockHeight: number,
+  opts?: {
+    pollMs?: number;
+    timeoutMs?: number;
+    graceMs?: number;
+    now?: () => number;
+    sleepFn?: (ms: number) => Promise<void>;
+  }
+): Promise<{
+  outcome: ConfirmOutcome;
+  slot: number | null;
+  error: string | null;
+}> {
+  const pollMs = opts?.pollMs ?? 2_000;
+  const timeoutMs = opts?.timeoutMs ?? 180_000;
+  // Keep asking for a moment after expiry: a tx included in one of the last
+  // valid blocks can take a beat to show up in getSignatureStatuses.
+  const graceMs = opts?.graceMs ?? 10_000;
+
+  const now = opts?.now ?? Date.now;
+  const sleepFn = opts?.sleepFn ?? sleep;
+
+  const start = now();
+  let lastError: string | null = null;
+  let expiredAt: number | null = null;
+  let resends = 0;
+
+  while (now() - start < timeoutMs) {
+    try {
+      const resp = await connection.getSignatureStatuses([signature], {
+        searchTransactionHistory: true,
+      });
+      const st = resp.value[0];
+      if (st) {
+        if (st.err) {
+          return {
+            outcome: "failed",
+            slot: st.slot ?? null,
+            error: JSON.stringify(st.err),
+          };
+        }
+        const conf = st.confirmationStatus;
+        if (conf === "confirmed" || conf === "finalized") {
+          return { outcome: "confirmed", slot: st.slot ?? null, error: null };
+        }
+      } else if (expiredAt !== null && now() - expiredAt >= graceMs) {
+        eprint(
+          `tx confirmation: blockhash expired after ${resends} re-broadcasts — ` +
+            "signature absent from the cluster, tx never landed"
+        );
+        return {
+          outcome: "dropped",
+          slot: null,
+          error: `blockhash expired (lastValidBlockHeight=${lastValidBlockHeight}); tx never landed`,
+        };
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+
+    if (expiredAt === null) {
+      // Same signed bytes — a duplicate is harmless, the cluster dedupes it.
+      try {
+        await connection.sendRawTransaction(rawTx, {
+          skipPreflight: true,
+          maxRetries: 0,
+        });
+        resends += 1;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+      try {
+        const height = await connection.getBlockHeight("confirmed");
+        if (height > lastValidBlockHeight) expiredAt = now();
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+    }
+
+    await sleepFn(pollMs);
+  }
+
+  return {
+    outcome: expiredAt === null ? "unknown" : "dropped",
+    slot: null,
+    error: lastError,
+  };
+}
+
+/**
+ * Take a blockhash now, re-sign every tx with it, and report when it dies.
+ * Journal must use the returned signature.
  */
 export async function prepareTxForSend(
   vtx: VersionedTransaction,
   txIndex: number,
   availableSigners: Keypair[],
-  getBlockhash: () => Promise<string>
+  getBlockhash: () => Promise<SendBlockhash>
 ): Promise<{
   vtx: VersionedTransaction;
   signature: string;
   refreshed: boolean;
   signers: string[];
+  lastValidBlockHeight: number;
 }> {
-  let out = vtx;
-  let refreshed = false;
-  if (txIndex > 0) {
-    const blockhash = await getBlockhash();
-    out = refreshVersionedBlockhash(out, blockhash);
-    refreshed = true;
-  }
+  // Every tx is re-signed with a blockhash taken now, tx[0] included: the
+  // build phase simulates twice and can take half a blockhash lifetime, so
+  // the one baked in at build time may already be close to expiry.
+  void txIndex;
+  const { blockhash, lastValidBlockHeight } = await getBlockhash();
+  const out = refreshVersionedBlockhash(vtx, blockhash);
   const required = v0Signers(out);
   const kps = pickSignersForPubkeys(required, availableSigners);
   out.sign(kps);
   return {
     vtx: out,
     signature: signatureFromVersioned(out),
-    refreshed,
+    refreshed: true,
     signers: required,
+    lastValidBlockHeight,
   };
 }
 

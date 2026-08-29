@@ -186,7 +186,7 @@ def poll_signature_status(
 
 
 def _apply_send_statuses(payload: Dict[str, Any]) -> None:
-    """Sync journal rows from exec JSON ``sends`` (confirmed/failed/unknown/not_sent)."""
+    """Sync journal rows from exec JSON ``sends`` (confirmed/failed/dropped/unknown/not_sent)."""
     sends = payload.get("sends")
     if not isinstance(sends, list):
         return
@@ -213,7 +213,7 @@ def _apply_send_statuses(payload: Dict[str, Any]) -> None:
             except KeyError:
                 pass
             continue
-        if status not in ("confirmed", "failed", "unknown"):
+        if status not in ("confirmed", "failed", "dropped", "unknown"):
             continue
         patch: Dict[str, Any] = {
             "status": status,
@@ -271,6 +271,33 @@ def _handle_journal_stderr_line(
         reply(f"@@JOURNAL-OK {sig}\n")
 
 
+# A signature absent from the cluster this long after the send can never land:
+# a blockhash lives ~150 slots (~60s), so nothing beyond this window is still
+# in flight. Same rule the manual /status journal-forget already applies.
+DROPPED_AFTER_SEC = 90.0
+
+
+def _entry_age_sec(entry: Dict[str, Any]) -> Optional[float]:
+    """Seconds since the journal row was written, or None if unparseable."""
+    from datetime import datetime, timezone
+
+    ts = entry.get("ts")
+    if not ts:
+        return None
+    text = str(ts)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        sent_at = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if sent_at.tzinfo is None:
+        sent_at = sent_at.replace(tzinfo=timezone.utc)
+    return (
+        datetime.now(timezone.utc) - sent_at.astimezone(timezone.utc)
+    ).total_seconds()
+
+
 def resolve_unresolved_signatures(
     *,
     rpc_url: str,
@@ -313,6 +340,21 @@ def resolve_unresolved_signatures(
                 "RPC unreachable or flaky — retry /status journal when the node is up, "
                 "or check explorer and /status journal-forget <sig> confirm if the tx is final."
             )
+        if outcome == "unknown" and not err:
+            # The node answered every time and the signature is nowhere. Past
+            # the blockhash window that is a final answer, not an unknown:
+            # the tx never landed and nothing was executed.
+            age = _entry_age_sec(e)
+            if age is not None and age >= DROPPED_AFTER_SEC:
+                exec_journal_io.update_by_signature(
+                    sig,
+                    {
+                        "status": "dropped",
+                        "slot": None,
+                        "error": f"not found {age:.0f}s after send — tx never landed",
+                    },
+                )
+                continue
         if outcome == "confirmed":
             exec_journal_io.update_by_signature(
                 sig, {"status": "confirmed", "slot": out.get("slot"), "error": None}
