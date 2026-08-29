@@ -44,7 +44,10 @@ rebalance_blocked_last_alert_at: Optional[datetime] = None
 _last_monitor_tick_at: Optional[datetime] = None
 _monitor_watchdog_alerted = False
 
-# Storm guards — process memory only (LITE_2). Reset on bot restart is intentional.
+# Storm guards. Persisted with the monitor timers since 29.08.2026: LITE_2 put
+# them in memory on the argument that "restarts are rare and every rebalance
+# still needs an exit plus a hold" — but the hold clock survives a restart and
+# these did not, so a restart handed the bot a fresh daily budget.
 _last_rebalance_at: Optional[datetime] = None
 _rebalance_day_utc: str = ""
 _rebalance_count_today: int = 0
@@ -80,12 +83,14 @@ def _record_rebalance(now: datetime) -> None:
     _ensure_rebalance_day(now)
     _rebalance_count_today += 1
     _last_rebalance_at = now
+    _persist_timers()
 
 
 def _mark_daily_limit_notified(now: datetime) -> None:
     global _daily_limit_notified_day
     _ensure_rebalance_day(now)
     _daily_limit_notified_day = _rebalance_day_utc
+    _persist_timers()
 
 
 def reset_storm_guards_for_tests() -> None:
@@ -427,7 +432,40 @@ def _check_unresolved_journal(*, where: str, now: datetime) -> bool:
 
 
 def _persist_timers() -> None:
-    monitor_timer_state.save_timers(out_of_range_since, last_auto_attempt_at)
+    monitor_timer_state.save_all(
+        out_of_range_since=out_of_range_since,
+        last_auto_attempt_at=last_auto_attempt_at,
+        last_rebalance_at=_last_rebalance_at,
+        rebalance_day_utc=_rebalance_day_utc,
+        rebalance_count_today=_rebalance_count_today,
+        daily_limit_notified_day=_daily_limit_notified_day,
+    )
+
+
+def restore_monitor_timers() -> None:
+    """Bring the monitor's clocks and storm counters back after a restart.
+
+    Both halves matter: the out-of-range clock decides whether the hold has
+    been served, the counters decide whether today's budget is spent.
+    """
+    global out_of_range_since, last_auto_attempt_at
+    global _last_rebalance_at, _rebalance_day_utc, _rebalance_count_today
+    global _daily_limit_notified_day
+
+    timers = monitor_timer_state.load_all()
+    out_of_range_since = timers["out_of_range_since"]
+    last_auto_attempt_at = timers["last_auto_attempt_at"]
+    _last_rebalance_at = timers["last_rebalance_at"]
+    _rebalance_day_utc = timers["rebalance_day_utc"]
+    _rebalance_count_today = timers["rebalance_count_today"]
+    _daily_limit_notified_day = timers["daily_limit_notified_day"]
+    if _rebalance_count_today:
+        log.info(
+            "сторожа восстановлены: ребалансов за %s — %s, последний %s",
+            _rebalance_day_utc or "?",
+            _rebalance_count_today,
+            _last_rebalance_at.isoformat() if _last_rebalance_at else "—",
+        )
 
 
 def _rpc_host_for_log(rpc_url: str) -> str:
@@ -928,13 +966,11 @@ async def monitor_position(*, now: datetime | None = None) -> None:
 
 
 async def main() -> None:
-    global out_of_range_since, last_auto_attempt_at
-
     _assert_mainnet_rpc_explicit()
     state_paths.state_dir().mkdir(parents=True, exist_ok=True)
     bot_logging.attach_state_file_log()
     boot_mode_line = bot_state.restore_mode()
-    out_of_range_since, last_auto_attempt_at = monitor_timer_state.load_timers()
+    restore_monitor_timers()
 
     range_restore = RangeRestoreResult(
         source="env",
