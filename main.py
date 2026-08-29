@@ -145,7 +145,15 @@ def _clear_good_position_snapshot() -> None:
     _last_good_bin_step = None
 
 
-def _auto_stopped_reasons(*, now: datetime, usable_sol: Optional[float]) -> list[str]:
+def _auto_stopped_reasons(
+    *,
+    now: datetime,
+    usable_sol: Optional[float],
+    pos: Optional[dict] = None,
+    usdc_ui: float = 0.0,
+    price: float = 0.0,
+    rent_info: Optional[dict] = None,
+) -> list[str]:
     """Why automation is not acting — heartbeat always reports these (LITE_4)."""
     reasons: list[str] = []
     if bot_state.bot_paused:
@@ -170,11 +178,41 @@ def _auto_stopped_reasons(*, now: datetime, usable_sol: Optional[float]) -> list
             f"достигнут дневной предел ребалансов "
             f"({_rebalance_count_today}/{bot_config.MAX_REBALANCES_PER_DAY})"
         )
-    if usable_sol is not None and usable_sol < bot_config.MIN_SOL_BALANCE:
-        reasons.append(
-            f"мало SOL для авто (доступно {usable_sol:.4f} < "
-            f"{bot_config.MIN_SOL_BALANCE})"
-        )
+    if usable_sol is not None:
+        if pos is None:
+            # Nothing to close first, so the wallet must fund an open by itself.
+            if usable_sol < bot_config.MIN_SOL_BALANCE:
+                reasons.append(
+                    f"мало SOL для открытия (доступно {usable_sol:.4f} < "
+                    f"{bot_config.MIN_SOL_BALANCE})"
+                )
+        else:
+            # With a position open the question is the one the monitor asks:
+            # after closing it — SOL, USDC and rent back, planned swap done —
+            # is there enough? Answering it with the bare "available now"
+            # figure reported automation as stopped while it was ready to act.
+            est = money_ops.rebalance_funding_estimate(
+                usable_sol=usable_sol,
+                pos=pos,
+                usdc_ui=usdc_ui,
+                price=price,
+                rent_info=rent_info,
+            )
+            need_sol = money_ops.need_sol_for_budget(est["est_budget"])
+            if money_ops.sol_short_after_planned_swap(
+                est_sol=est["est_sol"],
+                est_usdc=est["est_usdc"],
+                est_budget=est["est_budget"],
+                need_sol=need_sol,
+                price=price,
+            ):
+                need_s = f"{need_sol:.4f}" if need_sol is not None else "?"
+                reasons.append(
+                    f"мало бюджета даже после закрытия и свопа "
+                    f"(после close: SOL≈{est['est_sol']:.4f}, "
+                    f"USDC≈{est['est_usdc']:.2f}, нужно SOL≈{need_s}, "
+                    f"бюджет≈${est['est_budget']:.2f})"
+                )
     return reasons
 
 
@@ -290,7 +328,14 @@ def format_heartbeat(*, now: datetime | None = None) -> str:
         lines.append(f"   Статус: {status}")
         lines.append(f"Кошелёк: {sol_ui:.4f} SOL · {usdc_ui:.2f} USDC")
 
-    reasons = _auto_stopped_reasons(now=now, usable_sol=usable_sol)
+    reasons = _auto_stopped_reasons(
+        now=now,
+        usable_sol=usable_sol,
+        pos=pos if read_ok else None,
+        usdc_ui=usdc_ui,
+        price=usdc_per_sol,
+        rent_info=(bal or {}).get("positionRentForDefaultOpen") if read_ok else None,
+    )
     if reasons:
         lines.append("⏸ <b>Автоматика стоит:</b>")
         for r in reasons:
@@ -731,23 +776,17 @@ async def monitor_position(*, now: datetime | None = None) -> None:
             usable_sol = max(0.0, float(sao))
         else:
             usable_sol = max(0.0, sol_ui - bot_config.MIN_SOL_BALANCE)
-        pos_sol = float(pos.get("sol") or 0)
-        pos_usdc = float(pos.get("usdc") or 0)
-        est_sol = usable_sol + pos_sol
-        est_usdc = usdc_ui + pos_usdc
-        est_budget = (est_sol * price2 + est_usdc) * 0.98
-        if bot_config.MAX_POSITION_USD is not None:
-            est_budget = min(est_budget, float(bot_config.MAX_POSITION_USD))
-        need_sol: float | None = None
-        if est_budget >= 0.05:
-            try:
-                sug = money_ops.suggest_for_budget(est_budget)
-                need_sol = float(sug.get("needSol") or 0)
-            except Exception:
-                log.warning(
-                    "suggest-amounts for SOL gate failed — fallback usable_sol>0",
-                    exc_info=True,
-                )
+        est = money_ops.rebalance_funding_estimate(
+            usable_sol=usable_sol,
+            pos=pos,
+            usdc_ui=usdc_ui,
+            price=price2,
+            rent_info=bal.get("positionRentForDefaultOpen"),
+        )
+        est_sol = est["est_sol"]
+        est_usdc = est["est_usdc"]
+        est_budget = est["est_budget"]
+        need_sol = money_ops.need_sol_for_budget(est_budget)
         short_sol = money_ops.sol_short_after_planned_swap(
             est_sol=est_sol,
             est_usdc=est_usdc,

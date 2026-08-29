@@ -383,6 +383,69 @@ def sol_short_after_planned_swap(
     return est_usdc + 1e-12 < need_usdc_for_swap
 
 
+def position_rent_back_sol(pos: dict | None, rent_info: dict | None) -> float:
+    """Rent locked in the open position — it comes back to the wallet on close.
+
+    Not a loss and not spent: the position account is rent-exempt while it
+    exists and refunds in full when closed. Leaving it out of a rebalance
+    estimate understates the wallet by the price of a whole position.
+    """
+    if not pos or not rent_info:
+        return 0.0
+    try:
+        bins = int(pos["upperBinId"]) - int(pos["lowerBinId"]) + 1
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    if bins <= 0:
+        return 0.0
+    try:
+        return float(position_rent_sol_for_bins(bins, rent_info))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def rebalance_funding_estimate(
+    *,
+    usable_sol: float,
+    pos: dict | None,
+    usdc_ui: float,
+    price: float,
+    rent_info: dict | None = None,
+) -> dict:
+    """What a rebalance would have on hand once the current position is closed.
+
+    One estimate for both callers — the monitor that decides and the heartbeat
+    that reports. They used to compute this separately, and the report was the
+    pessimistic one: it announced "automation stopped, not enough SOL" while
+    the gate was perfectly willing to act.
+    """
+    pos_sol = float((pos or {}).get("sol") or 0)
+    pos_usdc = float((pos or {}).get("usdc") or 0)
+    rent_back_sol = position_rent_back_sol(pos, rent_info)
+    est_sol = max(0.0, float(usable_sol)) + pos_sol + rent_back_sol
+    est_usdc = float(usdc_ui) + pos_usdc
+    est_budget = (est_sol * float(price) + est_usdc) * 0.98
+    if bot_config.MAX_POSITION_USD is not None:
+        est_budget = min(est_budget, float(bot_config.MAX_POSITION_USD))
+    return {
+        "est_sol": est_sol,
+        "est_usdc": est_usdc,
+        "est_budget": est_budget,
+        "rent_back_sol": rent_back_sol,
+    }
+
+
+def need_sol_for_budget(est_budget: float) -> float | None:
+    """SOL leg a fresh position of this size needs, or None if unpriceable."""
+    if est_budget < 0.05:
+        return None
+    try:
+        return float(suggest_for_budget(est_budget).get("needSol") or 0)
+    except Exception:
+        log.warning("suggest-amounts for SOL gate failed", exc_info=True)
+        return None
+
+
 def suggest_for_budget(
     position_usd: float,
     *,

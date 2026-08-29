@@ -325,3 +325,147 @@ class StampTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutoReadyReportMatchesGateTests(unittest.TestCase):
+    """Отчёт сердцебиения и сторож монитора должны отвечать на один вопрос.
+
+    29.08 они отвечали на разные: сердцебиение писало «Автоматика стоит: мало
+    SOL для авто (доступно 0.0000)», а сторож в тот же момент был готов
+    ребалансить — он считает деньги ПОСЛЕ закрытия позиции и после свопа.
+    """
+
+    def _live_position_bal(self) -> dict:
+        # Реальные цифры 29.08 18:05: рента съела всё «доступное».
+        return {
+            "sol": {"ui": 0.0388},
+            "usdc": {"ui": 4.92},
+            "solAvailableForOpen": 0.0,
+            "positionRentForDefaultOpen": {
+                "binCount": 69,
+                "sol": 0.05740608,
+                "lamports": 57406080,
+                "onChainSizeBytes": 8120,
+            },
+        }
+
+    def _live_position(self) -> dict:
+        return {
+            "pubkey": "CcoS59y9",
+            "lowerBinId": -5690,
+            "upperBinId": -5626,
+            "sol": 0.0089,
+            "usdc": 3.07,
+            "fees": {"sol": 0, "usdc": 0},
+        }
+
+    def test_open_position_with_swappable_usdc_is_not_reported_as_stopped(self) -> None:
+        import bot_config
+        import bot_state
+        import main as main_mod
+
+        bot_state.bot_paused = False
+        bot_state.bot_frozen = False
+        main_mod.reset_storm_guards_for_tests()
+        now = datetime(2026, 8, 29, 18, 5, tzinfo=timezone.utc)
+
+        with (
+            patch.object(bot_config, "AUTO_REBALANCE", True),
+            patch.object(bot_config, "MIN_SOL_BALANCE", 0.05),
+            patch.object(bot_config, "MAX_POSITION_USD", 12.0),
+            patch("main.is_reopen_pending", return_value=False),
+            patch("meteora_exec.list_unresolved_journal", return_value=[]),
+            patch("main.money_ops.need_sol_for_budget", return_value=0.0417),
+        ):
+            reasons = main_mod._auto_stopped_reasons(
+                now=now,
+                usable_sol=0.0,
+                pos=self._live_position(),
+                usdc_ui=4.92,
+                price=104.9,
+                rent_info=self._live_position_bal()["positionRentForDefaultOpen"],
+            )
+
+        self.assertEqual(
+            reasons,
+            [],
+            f"автоматика была готова, а отчёт сказал обратное: {reasons}",
+        )
+
+    def test_open_position_without_any_money_is_still_reported(self) -> None:
+        """Обратная сторона: настоящую нехватку отчёт обязан показать."""
+        import bot_config
+        import bot_state
+        import main as main_mod
+
+        bot_state.bot_paused = False
+        bot_state.bot_frozen = False
+        main_mod.reset_storm_guards_for_tests()
+        now = datetime(2026, 8, 29, 18, 5, tzinfo=timezone.utc)
+        broke = dict(self._live_position(), sol=0.0, usdc=0.0)
+
+        with (
+            patch.object(bot_config, "AUTO_REBALANCE", True),
+            patch.object(bot_config, "MIN_SOL_BALANCE", 0.05),
+            patch.object(bot_config, "MAX_POSITION_USD", 12.0),
+            patch("main.is_reopen_pending", return_value=False),
+            patch("meteora_exec.list_unresolved_journal", return_value=[]),
+            patch("main.money_ops.need_sol_for_budget", return_value=0.0417),
+        ):
+            reasons = main_mod._auto_stopped_reasons(
+                now=now,
+                usable_sol=0.0,
+                pos=broke,
+                usdc_ui=0.0,
+                price=104.9,
+                rent_info=None,
+            )
+
+        self.assertTrue(
+            any("после закрытия и свопа" in r for r in reasons),
+            f"нехватка должна быть названа, получено: {reasons}",
+        )
+
+
+class RentComesBackOnCloseTests(unittest.TestCase):
+    """Рента позиции возвращается при закрытии — смета обязана её учитывать."""
+
+    def test_estimate_counts_position_rent(self) -> None:
+        import money_ops
+
+        rent_info = {
+            "binCount": 69,
+            "sol": 0.05740608,
+            "lamports": 57406080,
+            "onChainSizeBytes": 8120,
+        }
+        pos = {"lowerBinId": 0, "upperBinId": 68, "sol": 0.01, "usdc": 2.0}
+
+        est = money_ops.rebalance_funding_estimate(
+            usable_sol=0.0, pos=pos, usdc_ui=4.92, price=104.9, rent_info=rent_info
+        )
+        self.assertAlmostEqual(est["rent_back_sol"], 0.05740608, places=8)
+        self.assertAlmostEqual(est["est_sol"], 0.0 + 0.01 + 0.05740608, places=8)
+        self.assertAlmostEqual(est["est_usdc"], 6.92, places=6)
+
+    def test_wider_position_locks_more_rent(self) -> None:
+        import money_ops
+
+        rent_info = {
+            "binCount": 69,
+            "sol": 0.05740608,
+            "lamports": 57406080,
+            "onChainSizeBytes": 8120,
+        }
+        narrow = {"lowerBinId": 0, "upperBinId": 68, "sol": 0.0, "usdc": 0.0}
+        wide = {"lowerBinId": 0, "upperBinId": 200, "sol": 0.0, "usdc": 0.0}
+        self.assertGreater(
+            money_ops.position_rent_back_sol(wide, rent_info),
+            money_ops.position_rent_back_sol(narrow, rent_info),
+        )
+
+    def test_no_position_no_rent(self) -> None:
+        import money_ops
+
+        self.assertEqual(money_ops.position_rent_back_sol(None, {"sol": 1.0}), 0.0)
+        self.assertEqual(money_ops.position_rent_back_sol({"sol": 1.0}, None), 0.0)
