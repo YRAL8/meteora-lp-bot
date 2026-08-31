@@ -3,9 +3,10 @@
 Liquidity-providing bot for [Meteora DLMM](https://docs.meteora.ag/) pools on Solana,
 controlled from Telegram.
 
-**Status: rehearsed on devnet, not yet used on mainnet.** Every operation below has been
-executed against the real Meteora program on devnet with confirmed transactions. No
-mainnet position has been opened by this code.
+**Status: one full mainnet cycle done.** On 29.08.2026 a position was opened, lived in
+range and was closed for real money; everything below has also been rehearsed on devnet
+with confirmed transactions. A month of cycles is what a verdict needs, and that has not
+been run yet.
 
 ## How it is put together
 
@@ -18,6 +19,7 @@ each half does what it is good at:
 | **`ts/src/exec.ts`** | signs and sends, with a journal and a mainnet guard |
 | **`*.py`** | decisions, Telegram, bookkeeping — the parts that need no SDK |
 | **`meteora_position.py`** | reads positions straight off the chain, decoding accounts by hand without the SDK at all |
+| **`pool_snapshots.py`**, **`bin_snapshots.py`** | hourly read-only records of what the pool pays and where its money sits; off the money path, failures stay inside |
 
 Keeping assembly and sending in separate files is deliberate: the file that can move
 money is small and easy to audit, and `cli.ts` can be checked mechanically for the
@@ -85,11 +87,10 @@ is not implemented here.
 
 ## What is not done yet
 
-- **No automatic rebalancing.** Monitoring notices when price leaves the range and says
-  so, but only `/rebalance` acts, and only when asked.
-- **Not run on mainnet.** The two-switch guard exists precisely because that step has not
-  been taken.
-- `/pnl` works but has no meaningful history yet — cycles have to accumulate first.
+- **One position, so one range.** At bin step 4 that caps a range at ±1.37% (70 bins).
+  Going wider needs several position accounts, which is not implemented.
+- **No history to judge by.** One mainnet cycle has been run end to end (29.08.2026);
+  `/pnl` works but a verdict needs a month of cycles, not one.
 
 ## Running it
 

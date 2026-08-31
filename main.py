@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
+import bin_snapshots
 import bot_config
 import bot_logging
 import bot_state
@@ -1170,6 +1171,9 @@ async def main() -> None:
             snapshot_task = asyncio.create_task(
                 pool_snapshots.snapshot_loop(), name="pool-snapshots"
             )
+            bin_snapshot_task = asyncio.create_task(
+                bin_snapshots.snapshot_loop(), name="bin-snapshots"
+            )
 
             def _on_monitor_done(task: asyncio.Task) -> None:
                 if task.cancelled():
@@ -1198,6 +1202,7 @@ async def main() -> None:
                 watchdog_task.cancel()
                 heartbeat_task.cancel()
                 snapshot_task.cancel()
+                bin_snapshot_task.cancel()
                 for t in (monitor_task, watchdog_task, heartbeat_task, snapshot_task):
                     try:
                         await t
