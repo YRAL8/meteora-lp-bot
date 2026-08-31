@@ -226,7 +226,7 @@ def take_snapshot(
     read_bins_fn: Callable[..., dict[int, float]] | None = None,
 ) -> dict[str, Any]:
     """Write one JSONL row. Never raises."""
-    addr = pool or bot_config.pool_pubkey()
+    addr = pool or bot_config.snapshot_pool()
     row: dict[str, Any] = {"ts": _utc_iso(now), "pool": addr}
     try:
         meta = (fetch_pool or _fetch_pool)(addr)
@@ -240,7 +240,7 @@ def take_snapshot(
 
         session = requests.Session()
         session.headers["User-Agent"] = USER_AGENT
-        rpc_url = bot_config.effective_rpc()
+        rpc_url = bot_config.snapshot_rpc()
         state = mp.decode_lbpair_state(
             mp.solana_get_account_data(session, rpc_url, addr, sleep_s=config.request_sleep_s())
         )

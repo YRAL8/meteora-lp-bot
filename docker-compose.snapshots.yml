@@ -1,0 +1,34 @@
+# The research recorder on its own: reads the pool over HTTP and RPC, appends
+# two JSONL files, and touches nothing else. No Telegram token, no wallet, no
+# signing — so it can run for weeks before any money exists, which is the point:
+# a verdict needs a long series of hours, not a few.
+#
+# Its state volume is deliberately NOT the bot's. When the bot itself runs it
+# records the same two files, and one writer per file keeps the series honest —
+# so stop this service when the bot takes over, or keep them separate on purpose.
+#
+#   docker compose -f docker-compose.snapshots.yml up -d --build
+#
+services:
+  meteora-snapshots:
+    build: .
+    container_name: meteora-snapshots
+    restart: unless-stopped
+    command: ["python", "-u", "snapshots_only.py"]
+    environment:
+      # Watched pool and the node it is read from. Defaults are the mainnet
+      # SOL-USDC pool and the public node: read-only, no key needed.
+      SNAPSHOT_LB_PAIR: ${SNAPSHOT_LB_PAIR:-5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6}
+      SNAPSHOT_RPC_URL: ${SNAPSHOT_RPC_URL:-https://api.mainnet-beta.solana.com}
+      METEORA_STATE_DIR: /app/state
+      DRY_RUN: "true"
+    volumes:
+      - meteora-snapshots-state:/app/state
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  meteora-snapshots-state:

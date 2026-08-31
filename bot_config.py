@@ -161,6 +161,20 @@ def pool_pubkey() -> str:
     return os.getenv("DLMM_LB_PAIR", config.dlmm_lb_pair())
 
 
+def snapshot_pool() -> str:
+    """Pool the hourly recorders watch.
+
+    Defaults to the pool the bot trades. ``SNAPSHOT_LB_PAIR`` lets research keep
+    running against the mainnet pool while the money side stays in dry-run.
+    """
+    return os.getenv("SNAPSHOT_LB_PAIR", "").strip() or pool_pubkey()
+
+
+def snapshot_rpc() -> str:
+    """RPC the hourly recorders read. See :func:`snapshot_pool`; read-only."""
+    return os.getenv("SNAPSHOT_RPC_URL", "").strip() or effective_rpc()
+
+
 def wallet_keypair_path() -> Path:
     return Path(os.path.expanduser(WALLET_KEYPAIR_PATH))
 

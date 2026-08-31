@@ -156,6 +156,36 @@ POOL_META = {
 }
 
 
+class SnapshotTargetTests(unittest.TestCase):
+    """Research may watch mainnet while the money side is pinned to devnet."""
+
+    def test_defaults_to_the_pool_the_bot_trades(self) -> None:
+        import bot_config
+
+        with patch.dict(os.environ, {"DLMM_LB_PAIR": "TradedPool", "SNAPSHOT_LB_PAIR": ""}):
+            self.assertEqual(bot_config.snapshot_pool(), "TradedPool")
+
+    def test_override_wins_for_pool_and_rpc(self) -> None:
+        import bot_config
+
+        with patch.dict(
+            os.environ,
+            {
+                "DLMM_LB_PAIR": "TradedPool",
+                "SNAPSHOT_LB_PAIR": "WatchedPool",
+                "SNAPSHOT_RPC_URL": "https://watched.example",
+            },
+        ):
+            self.assertEqual(bot_config.snapshot_pool(), "WatchedPool")
+            self.assertEqual(bot_config.snapshot_rpc(), "https://watched.example")
+
+    def test_blank_override_is_not_an_address(self) -> None:
+        import bot_config
+
+        with patch.dict(os.environ, {"DLMM_LB_PAIR": "TradedPool", "SNAPSHOT_LB_PAIR": "   "}):
+            self.assertEqual(bot_config.snapshot_pool(), "TradedPool")
+
+
 class TakeSnapshotTests(unittest.TestCase):
     def test_writes_one_row_with_the_shape(self) -> None:
         with tempfile.TemporaryDirectory() as td:

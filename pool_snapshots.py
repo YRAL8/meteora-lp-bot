@@ -121,7 +121,7 @@ def take_snapshot(
     fetch: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Write one JSONL row. Never raises."""
-    addr = pool or bot_config.pool_pubkey()
+    addr = pool or bot_config.snapshot_pool()
     row: dict[str, Any] = {"ts": _utc_iso(now), "pool": addr}
     try:
         data = (fetch or _fetch_pool)(addr)

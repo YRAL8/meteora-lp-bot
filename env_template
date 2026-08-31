@@ -27,6 +27,13 @@ DLMM_LB_PAIR=5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 SOLANA_DEVNET_RPC_URL=https://api.devnet.solana.com
 
+# --- Hourly recorders (read-only, off the money path) ---
+# By default they watch the pool above through the network the bot trades on.
+# Set these to keep recording the mainnet pool while DRY_RUN pins the money side
+# to devnet; the standalone recorder (docker-compose.snapshots.yml) sets them.
+# SNAPSHOT_LB_PAIR=5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6
+# SNAPSHOT_RPC_URL=https://api.mainnet-beta.solana.com
+
 # Seconds between monitoring ticks.
 POLL_INTERVAL_SEC=300
 
